@@ -1,0 +1,539 @@
+---
+title: "scRNA_1_preprocessing"
+author: "akrenip"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# Purpose
+To create a single Seurat object containing the three datasets used in this project. The proprocessing workflow is done on UBC's Sockeye and divided into 3 parts: 
+
+1. Importing and some metadata wrangling. 
+2. Quality control largely adapted from the Harvard Bioinformatics Core workflow. Contains visualization of novelty and contamination levels.
+3. Normalization, finding top variable genes (features), and scaling. Since this project traces cell development, effects of cell-cycle are assessed here. 
+
+# Imports
+
+```{r libary}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(stringr)
+library(Azimuth)
+library(reticulate)
+
+options(future.globals.maxSize = 3e+09)
+```
+
+When creating a Seurat object, the given folder must have "barcodes.tsv", "genes.tsv", and "matrix.mtx" without any other prefix!
+
+Currently my datasets are organized as follows, with the GSE number and first authors are noted on the parent directory, and GSM number and replicate are noted in the subdirectories. The .gz files themselves are only named "barcodes.tsv", "genes.tsv", and "matrix.mtx". 
+
+- Note: The Sepp dataset is imported as a processed Seurat object, as provided by the Kaessmann lab. Thus, no barcode/genes/matrix files are needed for the Sepp_2024 dataset. 
+
+```{r specify_directories}
+# REPLACE the path parameters with the full filepath to the Vladoiu and Carter directories
+# Must be the directory with barcodes.tsv, genes.tsv, and matrix.mtx
+vladoiu.path <- list.dirs(path="/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/GSE118068_Vladoiu", full.names=TRUE, recursive=FALSE)
+carter.path <- list.dirs(path="/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/GSE224466_Carter", full.names=TRUE, recursive=FALSE)
+
+# create a named vector with timepoints and filepaths
+vladoiu.dir <- c()
+carter.dir <- c()
+
+# loops each directory and saves the timepoint suffix as the "key", the filepath as a "value"
+for (filepath in vladoiu.path) {
+  timepoint <- tolower(str_split_i(filepath, "_", -1))
+  vladoiu.dir[timepoint] = filepath
+}
+
+for (filepath in carter.path) {
+  timepoint <- tolower(str_split_i(filepath, "_", -1))
+  carter.dir[timepoint] = filepath
+}
+```
+
+
+```
+├── v5SeuratSignac_preprocessing.Rproj
+├── scRNA_preprocessing.Rmd
+├── GSE118068_Vladoiu 
+    ├── GSE118068_RAW.tar
+    └── GSM3317999_E10
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz
+    ├── etc. etc. etc. 
+    └── GSM3318007_P14
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz
+└── GSE224466_Carter
+    ├── GSE224466_RAW.tar
+    └── GSM7024833_PAN_CB_E13_A
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz
+    ├── etc. etc. etc.
+    └── GSM7024842_PAN_CB_P7B
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz 
+```
+Seurat's `Read10X` function accepts named vectors for multiple data directories. 
+
+
+### Dataset import
+
+The Vladoiu and Carter datasets are imported as a directory with barcodes.tsv, genes.tsv, and matrix.mtx
+
+The Sepp dataset needs to use the `Azimuth` package to convert its Ensembl IDs to gene names. It also needs to rename its "author_stage" metadata column as the active ident. These wrangled parts are then re-made into a new Seurat object. 
+
+Since this RStudio instance does not allow for internet connection (which Azimuth needs), these steps have been done in terminal (i.e. specifically in the v5SeuratSignac sandbox on Sockeye) and saved as a `sepp_seurat.RDS`. 
+
+For reference, this is verbatim what to type into terminal: 
+
+```
+sepp.seurat_full <- readRDS(paste0(dataset_dir, "2024_Sepp/ca7ed188-f4d0-420d-b4e7-d5a47f94ebbb.rds"))
+Layers(sepp.seurat_full)
+sepp.seurat_full[["RNA"]]$counts <- sepp.seurat_full[["RNA"]]$data
+sepp.seurat_full[["RNA"]]$data <- NULL
+
+# Sepp_2024 dataset uses enesembl IDs. Will need to convert before creating new Seurat object
+sepp.matrix <- sepp.seurat_full[["RNA"]]$counts
+sepp.matrix <- Azimuth:::ConvertEnsembleToSymbol(mat = sepp.matrix, species = "mouse")
+
+# The sepp dataset stores timepoint data as an "author_stage" column, and the active ident is just a local column.
+sepp.seurat_full@meta.data$orig.ident <- sepp.seurat_full@meta.data$author_stage
+sepp.seurat_full@meta.data <- sepp.seurat_full@meta.data %>%
+  mutate(orig.ident = case_when(
+    orig.ident == "E10.5" ~ "e10" ,
+     orig.ident == "E11.5" ~ "e11",
+     orig.ident == "E12.5" ~ "e12",
+     orig.ident == "E13.5" ~ "e13",
+     orig.ident == "E14.5" ~ "e14", 
+     orig.ident == "E15.5" ~ "e15",
+     orig.ident == "E17.5" ~ "e17",
+     orig.ident ==  "P0" ~ "p0",
+     orig.ident == "P4" ~ "p4",
+     orig.ident == "P7" ~ "p7",
+     orig.ident == "P14" ~ "p14",
+     orig.ident == "adult (9 weeks)" ~ "p63"
+  ))
+Idents(object = sepp.seurat_full) <- "orig.ident"
+
+sepp.seurat <- CreateSeuratObject(counts = sepp.matrix, meta.data = sepp.seurat_full@meta.data, project = "sepp")
+
+sepp.seurat@project.name <- "sepp"
+Idents(object = sepp.seurat) <- "orig.ident"
+
+saveRDS(sepp.seurat, "data/sepp_seurat.RDS")
+
+```
+
+```{r import_datasets}
+vladoiu.data <- Read10X(data.dir = vladoiu.dir)
+carter.data <- Read10X(data.dir = carter.dir)
+
+vladoiu.seurat <- CreateSeuratObject(counts = vladoiu.data, project = "vladoiu")
+carter.seurat <- CreateSeuratObject(counts = carter.data, project = "carter")
+sepp.seurat <- readRDS("2024_Sepp/sepp_seurat.RDS")
+
+# merge to run QC steps on both samples together
+merged.seurat <- merge(x = sepp.seurat, y = c(carter.seurat, vladoiu.seurat), add.cell.id = c("sepp", "carter", "vladoiu"))
+
+Layers(merged.seurat) # expected layers: counts.sepp, counts.carter, counts.vladoiu!
+
+merged.seurat@meta.data <- merged.seurat@meta.data %>%
+  mutate(
+    database.id = case_when(
+      grepl("vladoiu", colnames(merged.seurat)) ~ "Vladoiu_GSE118068",
+      grepl("carter", colnames(merged.seurat)) ~ "Carter_GSE224466",
+      grepl("sepp", colnames(merged.seurat)) ~ "Sepp_2024"
+    )
+  )
+# remove large objects
+rm(vladoiu.data, carter.data, vladoiu.seurat, carter.seurat, sepp.seurat)
+```
+
+# Quality control
+As recommended by [the Harvard Bioinformatics Core](https://github.com/hbctraining/scRNA-seq_online/blob/2b6165fd3867a9cbe242bbf5d1699c4b05ba70cf/lessons/03_SC_quality_control-setup.md#what-if-i-am-merging-more-than-two-samples), it will be useful to loosely label cell types in *each* timepoint before integrating, that way we can see if the integration reasonably meshes **and** separates cell types. 
+
+## Visualizing undesirable genes: mitochondrial, ribosomal, hemoglobin/platet
+```{r qc_1}
+# calculate percentage of mitochondrial genes detected per cell
+merged.seurat <- PercentageFeatureSet(merged.seurat, "^mt-", col.name = "percent_mito")
+
+# create a new column mitoRatio for later QC analysis
+merged.seurat$mitoRatio <- merged.seurat@meta.data$percent_mito / 100
+
+# percent ribosomal genes per cell
+merged.seurat <- PercentageFeatureSet(merged.seurat, "^Rp[sl]", col.name = "percent_ribo")
+
+# percentage of hemoglobin genes per cell, represents red blood cell contamination
+merged.seurat <- PercentageFeatureSet(merged.seurat, "^Hb[^(P)]", col.name = "percent_hb")
+
+# percentage of platlet genes per cell
+merged.seurat <- PercentageFeatureSet(merged.seurat, "Pwcam1|Pf4", col.name = "percent_platlet")
+
+# Add number of genes per UMI for each cell to metadata
+merged.seurat$log10GenesPerUMI <- log10(merged.seurat$nFeature_RNA) / log10(merged.seurat$nCount_RNA)
+```
+
+## Visualizing timepoints through QC metrics of interest. 
+
+### Novelty score
+
+Note that **novelty score** is a measure of complexity recommended by the [Harvard Bioinformatics Core tutorial](https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/04_SC_quality_control.md). It is the ratio of genes detected (nFeature_RNA) over number of UMI counts per cell (nCount_RNA), which offers the following interpretations: 
+
+- High nCount_RNA, low nFeature_RNA: Small number of genes sequenced over and over. 
+- Low nCount_RNA, low nFeature_RNA: Low complexity cell types could include red blood cells, or general artifacts/contamination. 
+
+Generally, a novelty score > 0.8 represents good quality cells. 
+
+### Contamination
+
+**Mitochondrial contamination** is assumed to be from dead or dying cells, and considered low quality if ratio is >= 0.2
+
+However, QC metrics should be evaluated as a whole. For example, cells with high mitochondrial counts might be cells using respiratory processes and may be cells you want to keep.
+
+General rule of thumb when performing QC is to set *lax thresholds* for individual metrics and **always consider joint effects** to avoid filtering out viable cell populations of interest.
+
+```{r rename_metadata}
+metadata <- merged.seurat@meta.data
+metadata$cells <- rownames(metadata)
+
+metadata <- metadata %>%
+        dplyr::rename(timepoint = orig.ident)
+```
+
+Since order is important for this metadata column, and the values themselves are stored as string, manually order setting is necessary here. 
+```{r qc_visualize}
+timepoint_order = c(
+  "e10",
+  "e11",
+  "e12",
+  "e13",
+  "e14",
+  "e15",
+  "e16",
+  "e17",
+  "e18",
+  "p0",
+  "p4",
+  "p5",
+  "p7",
+  "p10",
+  "p14",
+  "p63"
+)
+
+FeatureScatter(merged.seurat, "nCount_RNA", "nFeature_RNA", group.by = "orig.ident", pt.size = 0.5)
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+    ggplot(aes(x=timepoint, fill=timepoint)) + 
+    geom_bar(aes(x = factor(timepoint, level = timepoint_order))) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+    theme(plot.title = element_text(hjust=0.5, face="bold")) +
+    ggtitle("NCells")
+
+# E18, P5, and P14 are from Vladoiu exclusively, possibly explaining why the counts are smaller. 
+metadata %>% 
+    filter(timepoint == "e18" | timepoint == "p5" | timepoint == "p14") %>% 
+    ggplot(aes(x=timepoint, fill=timepoint)) + 
+    geom_bar(aes(x = factor(timepoint, level = timepoint_order))) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+    theme(plot.title = element_text(hjust=0.5, face="bold")) +
+    ggtitle("NCells")
+
+
+# Visualize the nCount_RNA (i.e. number UMIs or transcripts per cell)
+metadata %>%
+  ggplot(aes(x = nCount_RNA, fill = timepoint)) +
+  scale_fill_hue(labels = timepoint_order) + 
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500) + 
+  geom_vline(xintercept = 1000, colour="green", linetype = "longdash")
+
+# Visualize the distribution of genes detected per cell (nFeature_RNA) via histogram
+metadata %>% 
+    ggplot(aes(x=nFeature_RNA, fill= timepoint)) +
+    scale_fill_hue(labels = timepoint_order) + 
+    geom_density(alpha = 0.2) + 
+    theme_classic() +
+    scale_x_log10() + 
+    geom_vline(xintercept = 300)
+
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+    ggplot(aes(x=mitoRatio, fill=timepoint)) + 
+    geom_density(alpha = 0.2) + 
+    scale_fill_hue(labels = timepoint_order) + 
+    scale_x_log10() + 
+    theme_classic() +
+    geom_vline(xintercept = 0.2)
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI (NOVELTY score)
+metadata %>%
+    ggplot(aes(x=log10GenesPerUMI, fill=timepoint)) +
+    scale_fill_hue(labels = timepoint_order) + 
+    geom_density(alpha = 0.2) +
+    theme_classic() +
+    geom_vline(xintercept = 0.8)
+```
+
+To better summarize the quality per cell, this block will show number of genes vs UMIs, coloured by mitochondrial read ratio. 
+
+```{r joint_qc}
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+
+# default HBC quadrants
+metadata %>% 
+    ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=mitoRatio)) + 
+    geom_point() + 
+    scale_colour_gradient(low = "gray90", high = "black") +
+    stat_smooth(method=lm) +
+    scale_x_log10() + 
+    scale_y_log10() + 
+    theme_classic() +
+    geom_vline(xintercept = 500) + 
+    geom_hline(yintercept = 250) +
+    facet_wrap(~timepoint)
+
+# stringent quadrants
+metadata %>% 
+    ggplot(aes(x=nCount_RNA, y=nFeature_RNA, color=mitoRatio)) + 
+    geom_point() + 
+    scale_colour_gradient(low = "gray90", high = "black") +
+    stat_smooth(method=lm) +
+    scale_x_log10() + 
+    scale_y_log10() + 
+    theme_classic() +
+    geom_vline(xintercept = 1000) +  # default 500
+    geom_hline(yintercept = 1000) +  # default 250
+    facet_wrap(~timepoint)
+```
+
+Note: Poor quality cells usually have:
+
+1. low nGenes and low nUMIs (i.e. low-quality cells = *lower left* quadrant). 
+2. low nGenes and high nUMI (i.e. low complexity/dying cells = *lower right* quadrant).
+
+note: High mitochondrial read fractions (dark) iff cells have low nGenes and low nUMI could be a sign of damaged/dying cells. 
+- Cytoplasmic mRNA that has leaked through broken membrane. 
+- Only mRNA in mitochondria is detected.
+
+## Filtering
+
+### Cell-level filtering
+Using the subset() function on the Seurat object. All cells must pass the following thresholds:
+
+nUMI >= 1000
+nGene >= 1000
+log10GenesPerUMI >= 0.8
+mitoRatio < 0.2
+
+
+```{r cell-level filtering}
+joined.seurat <- JoinLayers(merged.seurat)
+filtered.seurat <- subset(
+  x = joined.seurat,
+  subset = 
+    (nCount_RNA >= 1000) &
+    (nFeature_RNA >= 1000) &
+    (log10GenesPerUMI > 0.80) &
+    (mitoRatio < 0.20)
+)
+Layers(filtered.seurat)
+```
+### Gene-level filtering
+
+Filter out genes with zero counts. Keeping these genes can dramatically reduce the average expression for a cell.
+
+Filter by prevalence to avoid bringing down average expression. Only genes expressed in 10 or more cells will be considered.
+```{r gene-level filtering}
+counts <- filtered.seurat[["RNA"]]$counts
+nonzero <- counts > 0
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+filtered_counts <- counts[keep_genes, ]
+filtered.seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered.seurat@meta.data)
+
+filtered.seurat[["RNA"]] <- split(filtered.seurat[["RNA"]], f = filtered.seurat$database.id)
+rm(counts, nonzero, keep_genes, filtered_counts)
+```
+
+## Visualization after QC filtering
+Finally, after subsetting for low-quality cells, we can visualize the cells that passed quality control
+
+```{r reassess_qc}
+metadata_clean <- filtered.seurat@meta.data
+metadata_clean$cells <- rownames(metadata_clean)
+metadata_clean <- metadata_clean %>%
+  dplyr::rename(timepoint = orig.ident)
+
+# cell counts
+metadata_clean %>%
+  ggplot(aes(x = timepoint, fill = timepoint)) +
+  geom_bar(aes(x = factor(timepoint, level = timepoint_order))) +
+  scale_fill_discrete(breaks = timepoint_order) +
+  theme_classic() +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  )) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("NCells")
+
+# cell counts by dataset
+metadata_clean %>%
+  ggplot(aes(x = timepoint, fill = database.id)) +
+  geom_bar(aes(x = factor(timepoint, level = timepoint_order))) +
+  scale_fill_discrete(breaks = timepoint_order) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  )) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("NCells")
+
+# cell counts by dataset
+metadata_clean %>%
+  ggplot(aes(x = database.id, fill = database.id)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  )) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("NCells")
+
+# UMI counts
+metadata_clean %>%
+  ggplot(aes(x = nCount_RNA, fill = timepoint)) +
+  scale_fill_discrete(breaks = timepoint_order) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("log10 cell density") +
+  geom_vline(xintercept = 1000)
+
+# Genes detected
+metadata_clean %>%
+  ggplot(aes(x = nFeature_RNA, fill = timepoint)) +
+  scale_fill_discrete(breaks = timepoint_order) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  scale_x_log10() +
+  geom_vline(xintercept = 1000)
+
+# UMIs vs genes
+metadata_clean %>%
+  ggplot(aes(x = nCount_RNA, y = nFeature_RNA, color = mitoRatio)) +
+  geom_point() +
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method = lm) +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 1000) +
+  geom_hline(yintercept = 1000) +
+  facet_wrap( ~ timepoint)
+
+# Mitochondrial counts ratio
+metadata_clean %>%
+  ggplot(aes(x = mitoRatio, fill = timepoint)) +
+  scale_fill_discrete(breaks = timepoint_order) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+
+# Novelty
+metadata_clean %>%
+  ggplot(aes(x = log10GenesPerUMI, fill = timepoint)) +
+  scale_fill_hue(labels = timepoint_order) + 
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+```
+
+# Standard Normalization
+
+Purpose is to find sources of unwanted variation, such that gene expression values account for sequencing depth and genes with different abundance. 
+
+**Normalization**: Adjusts raw count values such that expression counts are comparable across genes and samples. It's a two-step process of **scaling** then **transformation**. 
+
+**1. Scaling**: Multiplies each UMI count by a cell-specific factor such that all cells have the *same UMI count value*. Scaling helps values turn into comparable concentrations instead of absolute values that capture "uninteresting" variation between droplets. 
+**2. Transformation**: Includes classically simpler transformations like log-transformation. 
+- Note: [Seurat developers](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1874-1) noted that log-transformation doesn't effectively normalize genes with extremely low/high frequency. *Instead, SCTransform uses Pearson residuals for transformation*, which transforms via a gene-specific weight based on inferences about the gene's non-uniformity--which is useful for finding rare cell types. **However**, this workflow uses scVI integration, which, as of Nov 2024, is incompatible with SCT. 
+- Note: Please follow [this pull request](https://github.com/satijalab/seurat-wrappers/pull/184) for updates concerning "Using the scVI method of Integration in Seurat v5". 
+**Currently, "normal normalization" without SCT will be the preferred method of normalization because of SCT's incompatibility with scVI, the integration method of choice for this pipeline. **
+
+```{r normal_normalization}
+filtered.seurat <- NormalizeData(object = filtered.seurat) %>% 
+  FindVariableFeatures(nfeatures = 3000) %>%
+  ScaleData(vars.to.regress = c("mitoRatio")) # regress out mitochondrial contamination 
+
+joined.seurat = JoinLayers(filtered.seurat)
+```
+## Accessing effects of cell cycle
+When modeling differentiating processes (e.g. current use-case for embryonic cerebellar development), differences between quiescent and proliferating cells are relevant! Therefore, instead of removing all signals associated with cell cycle, [Seurat offers an alternative workflow](https://satijalab.org/seurat/articles/cell_cycle_vignette.html#alternate-workflow) where the difference between G2M and S phase are regressed out, thus keeping the difference between non-cycling (G0) and cycling cells.
+
+### Assigning cell cycle scores
+Based on a subset of genes, cells can be assigned to either G2/M or S phases. A cell expressing neither sets is likely in G1 phase and not cycling. 
+
+`set.ident = TRUE` means it will create a new `old.ident` column in metadata and store the resulting identities as the new `orig.ident`. 
+
+A new column called `CC.Difference` will store the difference between cell-cycle phase scores. 
+
+Note: Cell cycle scoring only [works on normalized data](https://github.com/satijalab/seurat/issues/7942#issuecomment-1783251658), not raw counts!
+
+```{r cell_cycle_scoring}
+# Use Seurat's cc.genes to create list of S- and G2-to-M-phase genes  
+s.genes <- str_to_title(cc.genes$s.genes)
+g2m.genes <- str_to_title(cc.genes$g2m.genes)
+
+# score data based on cell cycle gene list
+joined.seurat <- CellCycleScoring(joined.seurat, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# create a new metadata column with the cell cycle difference
+joined.seurat$CC.Difference <- joined.seurat$S.Score - joined.seurat$G2M.Score
+head(joined.seurat[[]])
+
+joined.seurat <-
+  ScaleData(joined.seurat,
+            vars.to.regress = c("CC.Difference", "mitoRatio")) %>%
+  RunPCA(features = c(s.genes, g2m.genes),
+         reduction.name = "pca.subset.CC") %>%
+  RunPCA(reduction.name = "pca.CC.Difference") 
+```
+
+# Saving / Loading
+
+Creates the `data/` directory inside the current working directory if needed, then saves. 
+```{r io_obj, eval=FALSE, include=FALSE}
+if (!dir.exists("data/")) {dir.create("data/")}
+print(paste0("Created directory data/ in ", getwd()))
+# if needed
+saveRDS(merged.seurat, "data/qc_merged_seurat_sepp_carter_vladoiu.RDS")
+saveRDS(filtered.seurat, "data/qc_done_seurat_sepp_carter_vladoiu.RDS")
+# obj used in next .rmd
+saveRDS(joined.seurat, "data/scored_joined_seurat.RDS")
+# if needed
+rm(merged.seurat, filtered.seurat)
+```

@@ -1,0 +1,1579 @@
+---
+title: "scRNA_3_annotation"
+author: "akrenip"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Purpose 
+To annotate the integrated SeuratObject based on gene markers. Subclustering will be performed on the cell lineages of interest, unipolar brush cells, granule cells, and cerebellar nuclei neurons. When subclustering, this workflow will use Seurat's `subset()` function and [start from raw counts](https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/seurat_subclustering.md)--such that the top variable genes are now based on the smaller subset of cells. 
+
+I have attempted both automated and manual annotation workflows:
+
+- The **automated** workflow uses Seurat's [label transfer](https://satijalab.org/seurat/articles/integration_mapping#cell-type-classification-using-an-integrated-reference).
+  - Label transfer requires one dataset be used as the "map" or answer key. Out of the three datasets, Sepp et al.'s (2024) dataset has the most extensive marker catalogue for each cell type. 
+    - Sepp et al. (2024) annotations also identified all cerebellar glutamatergic subtypes, unlike Carter et al.'s (2018) annotations.
+    - Sepp's dataset offers different levels of granularity: From `predictions_precise` to  `predictions_broad` for cell type annotations. Both options are explored (though ultimately shelved in favour of the manual workflow).
+- The **manual** workflow follows the [Harvard Bioinformatics Core's tutorial](https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/09_merged_SC_marker_identification.md) on marker identification. 
+  - Chosen markers are from literature specific to embryonic cerebellar development, more details in the sections below, including justification for each cluster about the final annotation chosen. 
+
+# Imports
+
+`FindConservedMarkers()` requires metap as a library. If you are on Sockeye, [install this older version](https://github.com/satijalab/seurat/issues/8169#issuecomment-1908057827) to avoid needing admin privileges. 
+
+```{r setup}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(patchwork)
+library(stringr)
+library(Azimuth)
+library(reticulate)
+
+# options(future.globals.maxSize = 3e+09)
+options(future.globals.maxSize = 16000 * 1024^2)
+```
+
+```{r load_obj}
+# joined.seurat <- readRDS("data/full_scvi_harmony_seurat.RDS")
+ref.seurat <- readRDS("2024_Sepp/sepp_seurat.RDS")
+annotations <- read.csv("data/annotations.csv")
+precise.seurat <- readRDS("data/unannotated_seurat.RDS")
+broad.seurat <- readRDS("data/unannotated_seurat.RDS")
+```
+
+Download relevant annotation data if needed, as suggested by [HBC's tutorial](https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/fetching_annotations.md).
+
+Personally, this is what I executed in Sockeye's login node, because this has internet access. 
+
+```
+cd /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/
+module load gcc apptainer
+apptainer shell --home /scratch/st-dg0ldo-1/akrenip/my_rstudio --env XDG_CACHE_HOME=/scratch/st-dg0ldo-1/akrenip/my_rstudio /arc/project/st-dg0ldo-1/rstudio/v5SeuratSignac/
+R
+library(AnnotationHub)
+
+# Connect to AnnotationHub
+ah <- AnnotationHub()
+
+# Access the Ensembl database for organism
+ahDb <- query(ah, 
+              pattern = c("Mus musculus", "EnsDb"), 
+              ignore.case = TRUE)
+
+# Acquire the latest annotation files
+id <- ahDb %>%
+        mcols() %>%
+        rownames() %>%
+        tail(n = 1)
+
+# Download the appropriate Ensembldb database
+edb <- ah[[id]]
+
+# Extract gene-level information from database
+annotations <- genes(edb, 
+                     return.type = "data.frame")
+
+# Select annotations of interest
+annotations <- annotations %>%
+        dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+
+# save
+write.csv(annotations, "data/annotations.csv")
+
+```
+# Creating predicted.id labels through automated label transfer
+
+## Projecting existing Sepp labels onto existing clusters
+
+By following the [Seurat tutorial to transfer anchors](https://satijalab.org/seurat/articles/integration_mapping#cell-type-classification-using-an-integrated-reference), the pre-annotated Sepp et al. (2024) dataset can provide a base annotation for the integrated dataset. 
+
+```{r data_transfer_from_sepp}
+ref.seurat <- NormalizeData(ref.seurat) %>%
+  FindVariableFeatures(nfeatures = 3000) %>%
+  ScaleData()
+ref.seurat <- RunPCA(ref.seurat) %>%
+  FindNeighbors(dims = 1:30) %>%
+  FindClusters()
+ref.seurat <- RunUMAP(ref.seurat, dims = 1:30)
+
+# find anchors based on reference (Sepp annotations)
+sepp.anchors <- FindTransferAnchors(reference = ref.seurat, query = precise.seurat, dims = 1:30,
+    reference.reduction = "pca")
+
+# transfer labels
+predictions_precise <- TransferData(anchorset = sepp.anchors, refdata = ref.seurat$precisest_label, dims = 1:30)
+predictions_broad <- TransferData(anchorset = sepp.anchors, refdata = ref.seurat$author_cell_type, dims = 1:30)
+
+# add metadata column
+precise.seurat <- AddMetaData(precise.seurat, metadata = predictions_precise)
+broad.seurat <- AddMetaData(broad.seurat, metadata = predictions_broad)
+
+# Listing of timepoint in order (reversing the list is needed later for visualization functions)
+timepoint_order = c(
+  "e10", "e11", "e12", "e13", "e14", "e15", "e16", "e17", "e18", "p0", "p4", "p5", "p7", "p10", "p14", "p63")
+rev_timepoint_order = timepoint_order[rev(1:length(timepoint_order))]
+
+# set orig.ident and database.id as a factor instead of character 
+precise.seurat$orig.ident <- factor(precise.seurat$orig.ident, levels = timepoint_order)
+precise.seurat$database.id <- factor(precise.seurat$database.id, levels = unique(precise.seurat$database.id))
+# saveRDS(precise.seurat, "data/precise_labels_seurat.RDS")
+# precise.seurat <- readRDS("data/precise_labels_seurat.RDS")
+
+broad.seurat$orig.ident <- factor(broad.seurat$orig.ident, levels = timepoint_order)
+broad.seurat$database.id <- factor(broad.seurat$database.id, levels = unique(broad.seurat$database.id))
+# saveRDS(broad.seurat, "data/broad_labels_seurat.RDS")
+# broad.seurat <- readRDS("data/broad_labels_seurat.RDS")
+```
+
+The following DimPlot() calls are to visualize the difference in annotation between Sepp's precise and broad label versions. 
+```{r visualize_precise_broad_transfer}
+precise_labels <- table(precise.seurat$predicted.id)
+precise_plot <- DimPlot(precise.seurat, reduction = "umap.scvi", group.by = "predicted.id", alpha = 0.1, raster = TRUE)
+broad_labels <- table(broad.seurat$predicted.id)
+broad_plot <- DimPlot(broad.seurat, reduction = "umap.scvi", group.by = "predicted.id", alpha = 0.1, raster = TRUE)
+
+precise_plot
+broad_plot
+DimPlot(broad.seurat, reduction = "umap.scvi", group.by = "predicted.id", label = TRUE, repel = TRUE, alpha = 0.1, raster = TRUE)
+```
+## Saving/Loading
+```{r io}
+# precise.seurat <- readRDS("data/precise_labels_seurat.RDS")
+broad.seurat <- readRDS("data/broad_labels_seurat.RDS")
+```
+
+# Identifying cell markers
+
+Follows [Seurat's tutorial](https://satijalab.org/seurat/articles/integration_introduction#identify-conserved-cell-type-markers) and the [Harvard Bioinformatics Core's tutorial](https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/09_merged_SC_marker_identification.md).
+
+Please note that using `FindAllMarkers()` is **recommended for evaluating a SINGLE SAMPLE GROUP/CONDITION**.
+
+Because we have integrated across conditions (i.e. datasets *and* timepoints), **the best option is to use FindConservedMarkers()**. 
+
+- Internally, separates out cells by sample group/condition, then finds DEG based on 1 cluster vs. all. 
+- The gene-level p-values for each condition are combined *across* groups using meta-analysis methods from the `MetaDE` R package.
+
+```{r find_markers}
+DefaultAssay(joined.seurat) <- "RNA"
+
+# Get number of cells per cluster and per sample of origin
+table(joined.seurat@meta.data$scvi_full_res.0.4, joined.seurat@meta.data$orig.ident)
+table(joined.seurat@meta.data$scvi_full_res.0.4)
+
+head(Idents(joined.seurat))
+```
+
+For reference: 
+  - `pct.1`: percentage of cells expressing the given gene in **this given cluster**. Separated by condition. 
+  - `pct.2`: percentage of cells expressing the given gene in **other clusters**. Separated by condition. 
+
+In other words, if pct.1 >> pct.2 && logFC is high, then that is a potential marker of interest because we assume hallmark...markers are ones that are cluster-specific and express boldly, AND that these clusters truly represent celltypes and not other uninteresting sources of biological/technical variation.
+
+```{r test_cluster0_conserved_markers, eval=FALSE, include=FALSE}
+joined.seurat = JoinLayers(joined.seurat)
+# find conserved markers for cluster 0. For current run, Cluster 0 is in the glutamatergic metacluster
+cluster0_conserved_markers <- FindConservedMarkers(
+  joined.seurat,
+  ident.1 = 0,
+  grouping.var = "orig.ident", # orig.ident stores timepoint!
+  min.cells.group = 3, # default is 3
+  only.pos = TRUE,
+  logfc.threshold = 0.25
+)
+
+# Combine markers with gene descriptions 
+# test case for just cluster 0 
+cluster0_annotated_markers <- cluster0_conserved_markers %>% 
+                tibble::rownames_to_column(var="gene") %>% 
+                left_join(y = unique(annotations[, c("gene_name", "description")]),
+                          by = c("gene" = "gene_name"))
+
+for (timepoint in rev_timepoint_order) {
+  cols <- colnames(cluster0_annotated_markers %>%
+                     select(starts_with(timepoint)))
+  if (length(cols) == 5) {
+    cols = cols[rev(1:length(cols))]
+    for (col in cols) {
+      # put all columns with this point at the FRONT
+      cluster0_annotated_markers <- cluster0_annotated_markers %>%
+        relocate(col, .after = gene)
+    }
+  }
+} 
+View(cluster0_annotated_markers)
+```
+
+```{r conserved_markers_forall}
+# Create function to get conserved markers for any given cluster
+get_conserved <- function(cluster){
+  FindConservedMarkers(joined.seurat,
+                       ident.1 = cluster,
+                       grouping.var = "orig.ident",
+                       only.pos = TRUE) %>%
+    tibble::rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name")) %>%
+    cbind(cluster_id = cluster, .)
+}
+
+total_clusters = length(levels(x = joined.seurat)) - 1
+
+# Iterate function across desired clusters
+conserved_markers <- purrr::map_dfr(0:total_clusters, get_conserved)
+
+for (timepoint in rev_timepoint_order) {
+  cols <- colnames(conserved_markers %>%
+                     select(starts_with(timepoint)))
+  if (length(cols) == 5) {
+    cols = cols[rev(1:length(cols))]
+    for (col in cols) {
+      # put all columns with this point at the FRONT
+      conserved_markers <- conserved_markers %>%
+        relocate(col, .after = gene)
+    }
+  }
+} 
+# save as a .csv and it's time to dig into excel! 
+write.csv(conserved_markers, "data/conserved_markers.csv", row.names=FALSE)
+```
+# Evaluating cell markers
+
+I arbitrarily/lazily/realistically chose to extract the top 25 cell markers. The MAIN QUESTION is given these top 25 markers, using known marker expression from literature, can I identify the cell type (or regretfully, cell types, plural) that are represented in this cluster? 
+From the committee's advice, I want to flag that developmental markers are highly context-dependent: 
+High logFC and pct.1 >> pct.2 is good, but often insufficient for mapping a cluster to a cell type. I must also consider the timepoints (i.e. especially if this developmental marker is transient) and not just the average logFC. 
+
+```{r extract_top25_markers}
+colnames_logfc <- grep("avg_log2FC", colnames(conserved_markers), value = TRUE)
+
+top25_per_cluster <- conserved_markers %>% 
+  mutate(avg_fc = rowSums(conserved_markers[, colnames_logfc], na.rm=TRUE) / length(colnames_logfc)) %>% 
+  group_by(cluster_id) %>% 
+  top_n(n = 25, wt = avg_fc) %>% 
+  relocate(avg_fc, .after = gene)
+
+# Visualize top 25 markers per cluster
+View(top25_per_cluster)
+
+# save as a .csv and it's time to dig into excel! 
+write.csv(top25_per_cluster, "data/top25_per_cluster.csv", row.names=FALSE)
+```
+
+# Conserved marker annotation, manually
+
+`annotated_broad.seurat` contains the automated label transfer using the broad labels. 
+
+Truthfully, I performed the manual annotations first before the automated workflow to keep myself as blind as possible, and for character building! 
+However, I do feel morally obligated to say that automated label transfer exists as an option, so I put it up there at the top so people read THAT part first. 
+
+Please note that labels like "_broad" and "_precise" denote the automated label transfer, and all manually annotated metadata is suffixed with a "_manual". 
+
+The "_full" vs "_short" in the metadata is for visualization purposes. "_full" contains annotations without any abbreviations, probably better for cluster labels, and "_short" does have abbreviations.
+
+```{r annotate_clusters}
+annotated_broad.seurat <- RenameIdents(
+  object = broad.seurat,
+  "0" = "Granule cells",
+  "1" = "Granule cell progenitors",
+  "2" = "Glial progenitors",
+  "3" = "Granule cells (differentiating)",
+  "4" = "Ventricular zone progenitors",
+  "5" = "Astrocytes/Bergmann glia",
+  "6" = "Interneurons",
+  "7" = "Purkinje cells",
+  "8" = "Brainstem progenitors",
+  "9" = "Glutamatergic cerebellar nuclei neurons",
+  "10" = "to-discard_Sepp_specific",
+  "11" = "Red blood cells",
+  "12" = "Red blood cells",
+  "13" = "Neural stem cells",
+  "14" = "Purkinje cells",
+  "15" = "Unipolar brush cells",
+  "16" = "Neural progenitor cells",
+  "17" = "Microglia",
+  "18" = "Rhombic lip progenitors",
+  "19" = "Meninges",
+  "20" = "GABAergic cerebellar nuclei neurons",
+  "21" = "to-discard_unknown",
+  "22" = "Isl1+ mesencephalon-derived cells",
+  "23" = "Endothelial cells",
+  "24" = "to-discard_unknown",
+  "25" = "to-discard_unknown",
+  "26" = "Mesencephalon-derived cells",
+  "27" = "Pericytes",
+  "28" = "Microglia",
+  "29" = "to-discard_unknown",
+  "30" = "Pericytes",
+  "31" = "to-discard_RBC_contaminated_astrocytes",
+  "32" = "Oligodendrocytes",
+  "33" = "Red blood cells",
+  "34" = "Purkinje cells (mature)",
+  "35" = "Red blood cells",
+  "36" = "Pericytes"
+)
+
+annotated_broad.seurat$celltype_full_scvi_0.4_manual <- Idents(annotated_broad.seurat)
+
+Idents(annotated_broad.seurat) <- "scvi_full_res.0.4"
+  
+annotated_broad.seurat <- RenameIdents(
+  object = annotated_broad.seurat,
+  "0" = "GC",
+  "1" = "GC_progenitors",
+  "2" = "Glial_progenitors",
+  "3" = "GC_differentiating",
+  "4" = "VZ_progenitors",
+  "5" = "Astrocytes_Bergmann_glia",
+  "6" = "Interneurons",
+  "7" = "Purkinje_cells",
+  "8" = "Brainstem_progenitors",
+  "9" = "Glutamatergic_CNN",
+  "10" = "to-discard_Sepp_specific",
+  "11" = "RBC",
+  "12" = "RBC",
+  "13" = "Neural_stem_cells",
+  "14" = "Purkinje_cells",
+  "15" = "UBCs",
+  "16" = "Neural_progenitor_cells",
+  "17" = "Microglia",
+  "18" = "RL_progenitors",
+  "19" = "Meninges",
+  "20" = "GABAergic_CNN",
+  "21" = "to-discard_unknown",
+  "22" = "Isl1+_mesencephalon_origin_cells",
+  "23" = "Endothelial_cells",
+  "24" = "to-discard_unknown",
+  "25" = "to-discard_unknown",
+  "26" = "Mesencephalon_derived_cells",
+  "27" = "Pericytes",
+  "28" = "Microglia",
+  "29" = "to-discard_unknown",
+  "30" = "Pericytes",
+  "31" = "to-discard_RBC_contaminated_astrocytes",
+  "32" = "Oligodendrocytes",
+  "33" = "RBC",
+  "34" = "Purkinje_cells_mature",
+  "35" =  "RBC",
+  "36" = "Pericytes"
+)
+annotated_broad.seurat$celltype_short_scvi_0.4_manual <- Idents(annotated_broad.seurat)
+
+DimPlot(annotated_broad.seurat, reduction = "umap.scvi", group.by = "celltype_short_scvi_0.4_manual", alpha = 0.1, raster = TRUE)
+
+DimPlot(annotated_broad.seurat, reduction = "umap.scvi", group.by = "celltype_short_scvi_0.4_manual", alpha = 0.1, label = TRUE, repel = TRUE, raster = TRUE)
+```
+
+```{r saving_loading_annotated_seurat}
+# saveRDS(annotated_broad.seurat, "data/annotated_broad_seurat.RDS")
+annotated_broad.seurat <- readRDS("data/annotated_broad_seurat.RDS")
+```
+
+## Annotation notes
+
+Purpose is to document the comparison made between the top 25 conserved markers per cluster (`top25_per_cluster`) from this integrated dataset vs. published marker lists. 
+The following marker lists were referenced: 
+
+- [Sepp et al.'s (2024) Supplementary Table 8](https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-023-06884-x/MediaObjects/41586_2023_6884_MOESM6_ESM.csv) which reports conserved cell state markers across human, opposum, and murine samples. Deemed an appropriate reference because of its large timepoint sampling, and focus on *conserved* markers. This table also documents if the marker functions as a transcription factor. 
+
+- [Vladoiu et al.'s (2019) Supplementary Table 3](https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-019-1158-7/MediaObjects/41586_2019_1158_MOESM4_ESM.xlsx) and [Extended figure 1](https://www.nature.com/articles/s41586-019-1158-7/figures/7) was also regularly used. It covers E10 to P14.
+
+- [Khouri-Farah et al's (2022) annotated markers](https://github.com/JLiLab/RNA_ATAC_Cerebellum/blob/main/marker_annotated.xlsx) which combines their E12, E14 mouse cerebellum scRNA-seq dataset with Carter's, representing E10 to E17. 
+
+**Please note**: The follow manual annotation was *done completely blind* from the automated anchor transfer on Seurat!
+
+```{r annotation_lists_first_passthrough, eval=FALSE, include=FALSE}
+annotation_short_scvi_0.4_manual <- c(
+  "GC",
+  "GC_progenitors",
+  "Glial_progenitors",
+  "GC_differentiating",
+  "VZ_progenitors",
+  "Astrocytes_Bergmann_glia",
+  "Interneurons",
+  "Purkinje_cells",
+  "Brainstem_progenitors",
+  "Glutamatergic_CNN",
+  "to-discard_Sepp_specific",
+  "RBC",
+  "RBC",
+  "Neural_stem_cells",
+  "Purkinje_cells",
+  "UBCs",
+  "Neural_progenitor_cells",
+  "Microglia",
+  "RL_progenitors",
+  "Meninges",
+  "GABAergic_CNN",
+  "to-discard_unknown",
+  "Isl1+_mesencephalon_origin_cells",
+  "Endothelial_cells",
+  "to-discard_unknown",
+  "to-discard_unknown",
+  "Mesencephalon_derived_cells",
+  "Pericytes",
+  "Microglia",
+  "to-discard_unknown",
+  "Pericytes",
+  "to-discard_RBC_contaminated_astrocytes",
+  "Oligodendrocytes",
+  "RBC",
+  "Purkinje_cells_mature",
+  "RBC",
+  "Pericytes"
+)
+annotation_full_scvi_0.4_manual <- c(
+  "Granule cells",
+  "Granule cell progenitors",
+  "Glial progenitors",
+  "Granule cells (differentiating)",
+  "Ventricular zone progenitors",
+  "Astrocytes/Bergmann glia",
+  "Interneurons",
+  "Purkinje cells",
+  "Brainstem progenitors",
+  "Glutamatergic cerebellar nuclei neurons",
+  "to-discard_Sepp_specific",
+  "Red blood cells",
+  "Red blood cells",
+  "Neural stem cells",
+  "Purkinje cells",
+  "Unipolar brush cells",
+  "Neural progenitor cells",
+  "Microglia",
+  "Rhombic lip progenitors",
+  "Meninges",
+  "GABAergic cerebellar nuclei neurons",
+  "to-discard_unknown",
+  "Isl1+ mesencephalon-derived cells",
+  "Endothelial cells",
+  "to-discard_unknown",
+  "to-discard_unknown",
+  "Mesencephalon-derived cells",
+  "Pericytes",
+  "Microglia",
+  "to-discard_unknown",
+  "Pericytes",
+  "to-discard_RBC_contaminated_astrocytes",
+  "Oligodendrocytes",
+  "Red blood cells",
+  "Purkinje cells (mature)",
+  "Red blood cells",
+  "Pericytes"
+)
+```
+### 0: Granule cells (progenitors to mature)
+
+- markers most highly expressed in later timepoints. Expression starts low at E15, peaks P14, no markers belong to P63.
+- Klf20a, Cenpe, Tpx2, Kif20a, * reported as a conserved marker for progenitor cells.
+- *Ccnb, Bub1b, Troap* for granule progenitor cells.
+
+### 1: Cerebellar granule cell progenitors (GCP)
+
+- E13 start, noticeably high Atoh1 from E15-17. No markers from P10.
+- Abca4, Loxl1 is a meningeal marker
+- Atoh1 is a glutamatergic marker. LogFC peaks at E15-17. Drops postnatally
+- Mcm6, Cdca7, is a progenitor/GCP marker
+- Hes6, Fst, Cxcr4 is a progenitor marker
+- Barhl1 is a glutamatergic/GCP marker
+- Otx2, Sp5 is a GCP marker
+- Fgfr4 is a neural stem cell marker. Signaling pathway maintains pluripotency
+
+### 2. Glial progenitors
+
+- Markers from E10 to E14. None by E15.
+- Astrocyte marker: Smpdl3a,
+- Oligoblast/oligoprogenitor: Sall3,
+- Progenitor: Metrn, Fgf19, Lipg
+- Glioblast: Gdpd2, Smpdl3a
+- Stem cells: Sox21, Metrn,
+- Microglia: Lpl
+
+### 3. differentiating GC
+
+- markers present from E18 to P14
+- differentiating GCs: Tubb3
+- Migration marker:  Nhlh1
+- granule cell differentiating: Neurod1
+- interneuron defined: Syndig1l
+- maturing Purkinje cell: Tex14,
+- VZ/NTZ neuroblast: Plk3, Cntn2,
+- Interneuron differentiating: Neurod6*,
+- Post mitotic NTZ neurons: Necab3
+- Glutamatergic CNN defined: Neurod6
+- Unipolar brush cell: Neurod6
+- GC/GCP: Necab3, A930011G23Rik
+- myelinating oligodendrocytes: Insc
+- Vascular endothelial cells: Map3k6, Gdpd5,
+
+### 4. Ventricular Zone (VZ) progenitors
+
+- Markers present E10 to E16
+- Brainstem progenitors: Klhl35, Lhx5*, Tfap2b, Robo3,
+- GABA CN defined: Dmbx1**, Lhx5
+- VZ neuroblast/progenitors: Dmbx1, Lhx5, Tfap2b, Tfap2a, Robo3, Neurog2, Pou3f1
+- GABA progenitors: Lhx5*, Tfap2b, Robo3*,
+- GABA interneuron differentiating: Lhx5*, Tfap2a, Tfap2b, Robo3, Neurog2,
+- Differentiating Purkinje cells: Tfap2a, Robo3*,
+- Parabrachial: Tfap2b,
+- Postmitotic NTZ neurons: Robo3
+
+### 5. Astrocytes/Bergmann glia
+
+- Markers from E16 to P14! Stays relatively high throughout
+- Neural Progenitor Cells: Gdf10, Aldh1l1,
+- Anterior neural progenitor cells: Aldoc,
+- Astrocyte: Gdf10,
+- Gliogenic Progenitors: Gdf10, Aldoc, Aldh1l1,
+- Astrocytic/Bergmann glia: Gdf10, Aldoc, Aldh1l1, Msx2,
+- Astrocytic/Bergmann glial precursors: Gdf10, Aldoc, Aldh1l1, Msx2
+- Proliferating VZ progenitors: Aldh1l1
+
+### 6. VZ Interneurons (early-late)
+
+- markers from E12 to P14
+- GABAergic precursor: Lhx5,
+- VZ progenitors: Lbx1, Skor1, Tfap2b, Lhx5,
+- VZ neuroblast: Pax2, Skor1, Tfap2b, Lhx5
+- VZ interneurons: Pax2
+- Interneuron precursor/differentiating: Slc6a5, Lhx5, Slc32a1
+- Interneuron defined: Slc6a5, Tfap2b, Pax2, Slc32a1, Pnoc, Gad1, Gad2,
+- Purkinje cells differentiating: Skor1, Tfap2b, Lhx5, Gad2,
+- post-mitotic NTZ neurons: Lhx5,
+- GABAergic CN: Gad2
+
+### 7. Purkinje cells
+
+- markers from E12 to P7
+- Purkinje differentiating: Esrrb, Foxp2, Bcl11a,
+- Purkinje maturing: Slc1a6, Arhgef33, Esrrb, Foxp2, Bcl11a
+- Purkinje cells defined, Arhgef33, Esrrb, Foxp2
+- Astrocyte/Bergmann glia precursors: Slc1a6, Kcnip1, Foxp2, Epha4, Bcl11a
+- Post mitotic NTZ neurons: Foxp2, Epha4, Bcl11a,
+- VZ neuroblast: Bcl11a,
+- Gliogenic progenitors: Epha4
+- GABA interneuron precursors: Bcl11a,
+- Red blood cells: Klhl4,
+
+### 8. Brainstem progenitors
+
+- markers from E12 to P7. Suspiciously no P5!
+    - expression peaks at E12, dips postnatally
+    - Gprin3 unknown! ontology: “Predicted to be involved in neuron projection development.” according to gene cards https://www.genecards.org/cgi-bin/carddisp.pl?gene=GPRIN3
+    - one of the clusters most fairly represented by three datasets…
+- Red blood cells: Ostf1, Fam84a,
+- Brainstem progenitors: Ostf1, Reln. Rwdd3, Cplx2, Nefm,
+- Neural progenitors: Ostf1, Reln
+- VZ progenitors proliferating: Fam84a,
+- Gliogenic progenitors: Reln, Rwdd3, Egfr,
+- Purkinje cells: Ostf1, Nefm,
+- GABA interneurons: Ostf1, Reln,
+- Purkinje cells: Reln, Cplx2,
+- Purkinje cells, differentiating: Nefm,
+- Granule cells defined, differentiating: Reln,
+- Post natal GCs: Nefm,
+- Postmitotic NTZ neurons: Nefm,
+- Endothelial cells: Cplx2
+- Astrocyte: Egfr,
+- Microglia: Ostf1,
+
+### 9. Glutamatergic CN neurons (early-late)
+
+- markers from E11 to P0. Suspiciously no E18!
+- Post mitotic NTZ neurons: Lhx9, Lhx2, Meis2,
+- Glutamatergic CN defined: C1ql3, Resp18, Meis2,
+- Isthmic nuclei defined: C1ql3,
+- GABA interneuron precursor: Chst8, Meis2
+- Oligodendrocyte precursor cells: Meis2
+
+### 10.Sepp-specific late…contaminated cell (to-discard!)
+
+- Expression only present P14, P63!
+    - warning, sepp-specific cluster!
+    - Lots of predicted genes (Gm) or RIKEN cDNA (Rik)
+    - might discard.
+- RBC: Acnat1
+
+### 11. Red blood cells
+
+(or meninges)…contaminated non-neural
+
+- expression from E11 to P0. Suspciously no E18!
+- Red blood cells: Ddit4l, Foxb1, Neurog2, Ascl1,
+- Meninges: Ascl1, Rab29,
+- Astrocyte: Scara3, Ddit4l,
+- Neural stem cells: Foxb1, Car14,
+- Differentiating Purkinje cells: Neurog2
+- Mesenchymal stem cells: Neurog2, Ascl1,
+- Gliogenic progenitors: Neurog2,
+- Pericytes: Car14,
+- VZ progenitors: Ascl1,
+- GABA interneurons: Ascl1,
+
+### 12. Red blood cells
+
+(or highly contaminated glutamatergic CN neurons…)
+
+- markers from E11 to P63! Suspiciously no P4, 5, 10…
+    - …Likely NOT UBCs? Because of the early timepoint
+- NTZ neuroblast: Slc17a6,
+- post mitotic NTZ: Snhg11, Meg3,
+- Astrocyte/Bergmann glia precursors: Snhg11, Meg3, Lrfn5, Caly,
+- Red blood cells: Snhg11, Meg3, Lrfn5, Mast4, Lmx1a, Rit2, Caly, Dmtn, Ccdc85a,
+- Excitatory CN neurons: Snhg11, Meg3, Lrfn5, Mast4, Lmx1a, Slc17a6, Caly,
+- Isthmic nuclei: Snhg11, Slc17a6
+- Brainstem progenitors: Meg3,
+- VZ progenitors: Meg3, Lmx1a**,**
+- Purkinje cell maturing: Lrfn5,
+- UBC: Lrfn5, Mast4, Lmx1a
+- GABAergic CN neurons: Lrfn5,
+- GABAergic interneurons: Lrfn5,
+- Roof plate-like stem cells: Lmx1a, Caly,
+- Parabrachial: Lmx1a, Slc17a6, Pou6f2,
+- Endothelial cells: Kifc2, Ccdc85a,
+- Purkinje maturing: Caly,
+
+### 13. Neural stem cells
+
+- markers from E10 to E15
+- Early proliferating VZ progenitors: Spag5,
+- Meninges: Spag5,
+- Red blood cells: Spag5, Dnah2,
+- Neural stem cells: Spag5, Sycp3, Knl1,
+- GCP: Knl1,
+
+Pretty low confidence. Will need to look at expression levels of Nes/Sox14/Notch?
+
+### 14. Purkinje cells
+
+Low confidence, after checking Rora and Calb2 separately, higher confidence. 
+
+- Markers from E10 to P0 (but suspciously no E18….again.)
+- Purkinje cells: Rpp25, Lhx1os, Tmem130,
+    - Early Purkinje cells: Slc32a1,
+    - Late Purkinje cells: Lhx1os,
+- Mesenchymal stem cells: Rpp25,
+- Mesencephalon-derived cells: Asic4,
+- VZ progenitors: Pnoc, Slc32a1,
+- GABAergic Interneurons defined: Pnoc, Slc30a3, Tmem130, Slc32a1,
+    - Interneuron precursors: Asic1,
+- GABAergic neuron precursors: Lmo1, Lhx1os,
+- Red blood cells: Cxcl14, Chst1, Lmo1, Tmem130,
+- Endothelial cells: Chst1, Slc32a1,
+- Astrocytes: Chst1, Lhx1os,
+- Glutamatergic CN: Lmo1, Lhx1os, Tmem130,
+- GABAergic CN: Slc32a1,
+- Gliogenic progenitors: Lmo1, Dusp15,
+- Post mitotic NTZ neurons: Lmo1, Lhx1os, Slc32a1,
+- Microglia: Dusp15,
+- Oligodendrocyte: Dusp15,
+
+### 15. Unipolar brush cells
+
+- Markers from E14 to P63
+- Very noticeable Lmx1a, Eomes, Mab21l2, Otx2
+- MUAHAHAHA it’s BEAUTIFUL!!!
+
+### 16. Progenitors
+
+- markers from E11 to P4 (no E18…)
+    - notably Wls! But rmr that from Joanna’s paper, Wls is complementary to + independent from Atoh1 expression
+    - But Wls is pretty much everywhere….and this cluster’s persistence into P4 excludes RL possibility
+- progenitor: Glis3, Adgrv1m, Prdm16, Rfx2, Rreb1, Depdc1a, Kif24, Wls, Ecm2, Megf10, Flnc,
+- glioblast: Glis3, Prdm16, Rfx2, Rreb1, Megf10,
+- neural stem cells: Adgrv1, Otx2os1,
+- Oligodendrocyte progenitor: Megf10, Stk32a,
+- Mesenchymal stem cells: Wls,
+- NTZ neuroblast: Wls,
+- VZ neuroblast: Adgrv1, Wls,
+- GABA interneurons: Otx2os1, Jph1,
+- Postnatal GCPS: Otx2os1, Depdc1a, Kif24,
+- Granule cell defined: Jph1,
+- Pericytes: Otx2os1
+- UBCs: Otx2os1,
+- astrocyte: Rfx2, Wls, Wwtr1, Stk32a,
+- meningeal: Rreb1, Wwtr1,
+- immune: Rreb1,
+- Red blood cells: Rreb1, Wls, Ecm2, Flnc,
+- “posterior transitory zone”: Wls
+    - note that this is a region of RL argued by Khouri-Farah et al. to be distinct
+
+### 17. Microglia
+
+- Markers from E14 to P63
+- Oligodendrocyte progenitor: Sox10, Olig2, Sox8, Bcan,
+- Oligodendrocyte: Sox10, Olig2, Sox8,
+- Microglia: Sox10, Olig1, Olig2, Lims2, Nkx2-2, Sox8, Bcan,
+- Red blood cells: Sox10, Olig1, Olig2, Cspg4,
+- Astrocyte: Sox8, Bcan,
+- Glioblast: Sox8, Bcan
+
+### 18. Rhombic lip progenitors
+
+- Markers only from E10 to E14!
+    - Possibly developing glutamatergic CN neurons? Look at Tbr1 vs Eomes expression?
+- Atoh1, albeit quite low, but pct.1 >> pct.2 throughout, peaking at E13.
+- Upper rhombic lip precursors: Barhl1,
+- GCP: Barhl1, Atoh1,
+- GC differentiating: Barhl1,
+- UBC differentiating: Barhl1, Atoh1, Selm,
+- CN: Grem2, Atoh1, Evx1, Lhx9, Selm,
+- NTZ neuroblast: Barhl1, Evx1, Lhx9,
+- Brainstem progenitors: Barhl1,
+- Neural stem cells: Selm,
+- GABA interneuron precursors (?!?!): Grem2, Atoh1, Evx1, Lhx9,
+- Red blood cells: Cdkn2b, Selm, Lsp1,
+- Endothelial cells: Selm,
+- Microglia: Lsp1,
+
+### 19. Meninges
+
+- Markers present from E10 to E12!! (even shorter than cluster 18)
+- Meninges: Lum, Col1a1, Tbx18,
+- Choroid plexus epithelium: Lum, Col1a1,
+- Red blood cells: Lum, Osr1, Col1a1, Tbx18,
+- Astrocyte/Bergmann glia: Lum, Col1a1, Tbx18,
+- Gliogenic progenitors: Twist2,
+- Pericytes: Col1a1, Col3a1,
+
+### 20. GABAergic CN neurons
+
+- markers present from E12 to P0
+- VZ neuroblast: Dmbx1,
+- Excitatory CN neurons: Zfhx3, Zfhx4, Tox,
+- GABAergic CN defined: Dmbx1, Zfhx3, Zfhx4, Adarb2, Tox, Grik3,
+- Purkinje cells differentiating: Zfhx4, Tox2, Cdk14,
+- Astrocyte/Bergmann glia: Plcb4, Lgi1,
+    - Astrocyte/Bergmann glia precursors: Cntnap5a,
+- Interneuron: Adarb2,
+- GC defined: Lgi1,
+- Meninges: Cdk14,
+- Red blood cells: Cdk14,
+
+### 21. Unknown (to-discard)
+
+- possible contaminated cells. to discard?
+- Markers present from E13 to E14
+- Very low log fold change, pct1 vs pct2: very low as well…
+- Oligodendrocyte precursor: Il27,
+- Red blood cells: Il27,
+
+### 22. Isl1+ Mesencephalon-derived cells
+
+- markers present from E10 to E14, but no markers present at E13
+- Isl1+
+- Mesencephalon-derived cells: Isl1, Sncg, Nefl, Islr2,
+- Interneuron defined: Ache, Golga7b,
+- Isthmic nucleus defined: Ache,
+- GC defined: Golga7b,
+- Endothelial cells: Golga7b,
+- Red blood cells: Golga7b, Nefl,
+- Purkinje cell maturing: Nefl,
+- Purkinje cell late: Nefl, Islr2,
+- Brainstem progenitors: Islr2,
+
+### 23. Endothelial cells
+
+- markers present from E10 to P14
+- Strikingly high logFC (i.e. top 25 markers are consistently above 8-fold) and (thankfully) pct.1 >>> pct.2
+- endothelial cells (vladoiu key marker): Cldn5
+- meninges: AU021092, Tmem252, Icam2, Myct1, Sox17,
+- red blood cells: AU021092, Ly6c1, Tmem252, Icam2, Myct1, Sox17
+
+### 24. Unknown (to-discard)
+
+- Likely Sepp-specific
+- markers present P7, P14, P63. Peaks P63 sharply from P7. Probably represents older cell populations.
+- GABA CN defined: Ankrd55, Sorcs3, Grik3,
+- Isthmic nucleus defined: Ankrd55,
+- Interneuron defined: Sorcs3, Slc6a5, Tfap2b, Lypd6,
+- Interneuron differentiating: Slc6a5, Tfap2b, Kit,
+- Parabrachial: Slc5a7, Tfap2b,
+- VZ neuroblast: Tfap2b,
+    - mind the timepoint!
+- Astrocyte/Bergman glia precursors: Parm1,
+    - …mind the timepoint
+- Purkinje cell maturing: Shisa6, Kit, Vav3,
+- Glutamatergic CN defined: Vav3,
+- Endothelial cells: Vav3,
+
+### 25. Unknown (to discard)
+
+- markers not found!
+- red blood cells: Nxpe2
+
+### 26. Mesencephalon-derived cells
+
+- markers from E10 to P0. No E18 representation!
+- Mesencephalon-derived cells: Sncg, Pou4f1, Lef1, Scn9a, Pou6f2, Tmem163, Onecut2
+- Meninges: **Lef1**,
+- Red blood cells: Lef1, Parvb, Prss12, Scn9a, Onecut2,
+- Microglia: Parvb, Tmem163,
+- Purkinje maturing: Scn9a,
+- GABA CN defined: Scn9a,
+- GABA interneuron precursors: Tmem163, Onecut2,
+- Glutamatergic CN defined: Scn9a, Tmem163,
+- GC defined: Tmem163,
+- isthmic nuclei defined: Scn9a, Tmem163, Onecut2,
+- Endothelial cells: Scn9a,
+- Parabrachial: Pou6f2, **Tmem163**, Onecut2,
+- Oligodendrocyte precursor cells: Onecut2,
+
+### 27. Pericytes
+
+- markers present from…E10 to E12, the P0 to P5
+- logFC all fairly high, although top markers like Ttr return no hits
+- Bergmann glia/astrocytes: Smim22, Fxyd1, Wdr86,
+- Pericytes: Smim22, Krt18, Folr1, Sostdc1, Pcp4l1,
+- Red blood cells: Smim22, Fxyd1, Ocln, Wdr86,
+- PTZ neurons: Krt18, Folr1, Pcp4l1,
+- Oligodendrocyte precursor cells: Col8a2, Ocln,
+- VZ progenitors: Ocln,
+- Meninges: Pcp4l1,
+
+### 28. Immune cells (microglia)
+
+- markers present at all timepoints sampled!
+- LogFC very very high
+- Microglia: Siglech, C1qa, Ctss, Ly86,
+- Red blood cells: Siglech, C1qa, Ctss, Gna15, Selplg, Ly86, Cd84,
+- Immune cells (generic): C1qa, Ctss, Ly86,
+
+### 29. Unknown (to discard)
+
+- markers only present E13 to E14. Really peaks E14 but pct.1 is only somewhat higher than pct.2
+- Red blood cells: Abca15, Car1,
+- VZ progenitors: Car1
+
+### 30. Pericytes
+
+- markers present E10 to P14
+- Pericytes: Rgs5, Kcnj8
+
+### 31. Astrocytes/Red blood cells (to discard)
+
+- Markers only present P14, P63…so only Vladoiu and Sepp represented
+- Astrocytic markers are “conserved” across species according to Sepp, but RBC markers frequent according to Vladoiu…
+- astrocyte: Tnc, Slc7a10, Gdf10, F3, Gpr37l1, Slc1a3, Dao,
+- meninges: Tnc, Gria1, Gdf10, Cyp26b1, Slc1a3, Pla2g7,
+- Red blood cells: Tnc, A2m, Slc7a10, F3, Cyp26b1, Lcat, Fgfr3, Gpr37l1, Pla2g7, Tlcd1, Paqr6
+- Pericytes: F3,
+- Mesenchymal stem cells….: Cyp26b1,
+- glioblast…: Tnc, Slc1a3,
+- progenitor….: Tnc, Cyp26b1, Lcat, Fgfr3, Gpr37l1, Slc1a3, Pla2g7,
+- GABA progenitors…: Cyp26b1,
+- proliferating VZ cells…: Tnc, Cyp26b1,
+
+### 32. Oligodendrocytes
+
+- markers present from E10-11, E16
+- Oligodendrocyte: Erbb3, Cdh19, Wnt6, **Sox10**,
+- Oligodendrocyte progenitor: Sox10,
+- Red blood cells: Erbb3, Foxd3, Sox10, Wnt6, Cryab,
+- Pericytes: Erbb3, Wnt6,
+- Microglia: Erbb3, Sox10,
+- Mesencephalon-derived cells: Erbb3,
+- Astrocyte/Bergmann glia: Wnt6,
+
+### 33. Red blood cells
+
+- markers available E18 to P63
+- Red blood cells: Col6a1, Cmbl, Col13a1, Col1a2, Rbp1, Ranbp3l, Apod, Cfh
+- Astrocyte: Gjb6, Col1a2, Ranbp3l,
+- Meninges: Col13a1, Col1a2, Ranbp3l,
+- Pericytes: Rbp1, Apod, Cfh,
+- Microglia: Cfh,
+- Cerebellar granule cells: Ptgds,
+- neural progenitor cells: Ranbp3l,
+- Vascular endothelial cells: Apod
+
+### 34. Purkinje cells (mature)
+
+- markers present from P4, P5, P7
+    - where dark blue are Purkinje cells
+    
+    ![https://www.nature.com/articles/s41586-023-06884-x/figures/1](https://prod-files-secure.s3.us-west-2.amazonaws.com/48428d7a-8e31-484e-a27b-334f4c905a59/a03b5d36-3a44-461b-af5b-ccd4b3ed2f52/image.png)
+    
+    https://www.nature.com/articles/s41586-023-06884-x/figures/1
+    
+- Purkinje cell: Arhgef33, Tmem132d,
+- Purkinje maturing: Arhgef33, Zfp385c, Nrk, Itpr1, Tmem132d,
+- Astrocyte/Bergmann glia precursors: Nrk, Tmem132d,
+- Endothelial cells: Itpr1,
+
+### 35. Red blood cells
+
+- markers present from E10 to P14
+- Top markers are hemoglobin: Hbb-bt, Hba-a2, Hbb-bs. Very high, 8+ FC lmao
+
+### 36. Pericytes
+
+- markers present from E16 to P14, remains high throughout timepoints
+- differentiating Purkinje cells: Wdr63,
+- Pericytes: Hdc, Lrrc71, Odf3b, Zp3,
+- Mesencephalon-derived cells: Tekt4,
+- Neural progenitor cells (early)…: Lrrc74b,
+
+
+
+
+
+
+### Vladoiu markers 
+
+```{r vladoiu_markers}
+markers.vladoiu = c(
+    "Prrx2", "Lmx1a", "Nes", "Olig3", # early progenitors
+    "Atoh1", "Eomes", "Lhx2", "Lhx9", # glutamatergic lineage
+    "Ptf1a", "Ascl1", "Rora", "Calb2", "Pax2", # GABA lineage
+    "Fabp7", "Aldh1l1", "Gdf10", "Olig1", "Pdgfra", "Mobp", # glia
+    "Cldn5", "Hbb-bs", "Cxcl12", "Rgs5", "Aif1" # non-neural
+  )
+progenitor.vladoiu = markers.vladoiu[1:4]
+glutamatergic.vladoiu = markers.vladoiu[5:8]
+gabaergic.vladoiu = markers.vladoiu[9:13]
+glial.vladoiu = markers.vladoiu[14:19]
+nonneural.vladoiu = markers.vladoiu[20:24]
+
+gluta.vladoiu = c("Atoh1", "Eomes", "Lhx2", "Lhx9") 
+gaba.vladoiu = c("Ptf1a", "Ascl1", "Rora", "Calb2", "Pax2")
+glia.vladoiu = c("Fabp7", "Aldh1l1", "Gdf10", "Olig1", "Pdgfra", "Mobp") 
+nn.vladoiu = c("Cldn5", "Hbb-bs", "Cxcl12", "Rgs5", "Aif1")
+```
+
+
+### Sepp markers
+
+Those under "E13: Cell types/states/subtypes born at RL and NTZ" reference Extended Data Fig. 4. 
+
+For Purkinje neurons, please not that: 
+  - Rorb purkinje_defined has highest abundace at E12, dipping drastically by E13-E17. 
+  - Foxp1 subtype peaks at E13
+  - Cdh9 peaks at E15
+  - Etv1 at P0
+  - Purkinje_maturing starts very low at E13, and rises rapidly from E15-17, reaching past 50% abundance by P0
+  - Please see Extended Data Fig. 3i for reference. 
+```{r sepp_markers}
+# E13: Cell types/states/subtypes born at RL and NTZ 
+nuclear_transitory_zone_neuroblast.sepp = c("Dll1", "Barhl1", "Slc17a6")
+# differentiating isthmic nuclei neurons, born at the rhombic lip or isthmic ventricular zone
+isthmic_nuclei_neurons_differentiating.sepp = c("Slc17a6", "Pax5")
+isthmic_nuclei_neurons_defined.sepp = c("Slc17a6", "Pax5", "Scg2", "Gabra2", "Gabrg3")
+isthmic_nuclei_defined_subtypes.sepp = c("Lhx9", "Nr4a2", "Sst", "Adarb2", "Slc5a7")
+glutamatergic_cerebellar_nuclei_neurons_defined.sepp = c("Slc17a6", "Neurod6", "Gabra2")
+glutamatergic_cerebellar_nuclei_neurons_ventral.sepp = c("Lmo3", "Lhx9")
+glutamatergic_cerebellar_nuclei_neurons_posterior.sepp = c("Lmx1a")
+
+# E13, E15: VZ cell types
+vz_neuroblast.sepp = c("Notch1", "Tfap2a", "Pax3", "Nfia", "Nfib")
+parabrachial.sepp = c("Lmx1b", "Lmx1a", "Zfhx3", "Zfhx4")
+noradrenergic.sepp = c("Lmx1b", "Phox2b", "Zfhx3", "Zfhx4", "Dab1")
+gaba_cnn_defined.sepp = c("Zfhx3", "Zhfx4", "Sox14", "Foxp2")
+purkinje_differentiating.sepp = c("Foxp2", "Skor2", "Pax3", "Zfhx3")
+# Rorb, Foxp1, Cdh9, Etv1 are subtypes
+purkinje_defined.sepp = c("Foxp2", "Skor2", "Dab1", "Pax3", "Rorb", "Foxp1", "Cdh9", "Etv1")
+purkinje_maturing.sepp = c("Dab1", "Itpr1", "Foxp2", "Skor2")
+
+# glial cell types
+astroglia.sepp = c("Nckap5", "Clybl", "Slit2", "Pax3", "Cyp26b1", "Slc6a11", "Glis3", "Top2a")
+ependymal.sepp = c("Spag17", "Glis3")
+oligodendrocte.sepp = c("Tnr", "Sox10", "Mag")
+
+# conserved markers for glutamatergic cell types
+glutamatergic_cnn.sepp = c("Meis2", "Lhx9", "Lmx1a", "Lmx1b", "Tfap2b")
+unipolar_brush_cell_differentiating.sepp = c("Pax6", "Lmx1a", "Zic5", "Zic4", "Eomes", "Otx2", "Prdm8", "Bhlhe22", "Barhl1")
+unipolar_brush_cell_defined.sepp = c("Eomes", "Zic4", "Otx2", "Tlx3","Bhlhe22")
+granule_cell_progenitors.sepp = c("Pax6", "Zic4", "Barhl1", "Hes6", "E2f1", "Hivep2", "Tox3")
+granule_cell_differentiating.sepp = c("Pax6", "Barhl1", "Zic4", "Zic5", "Hivep2")
+granule_cell_defined.sepp = c("Etv1", "Klf9", "Hivep2","Nr3c1", "Zic4", "Creb5")
+
+# conserved non neural cell types
+meningeal.sepp = c("Tcf7l1", "Tcf7l2", "Prrx1", "Foxp2", "Foxp4", "Fli1", "Prdm5", "Tbx18", "Id1", "Znf367")
+immune.sepp = c("Mitf", "Mef2c", "Ikzf1", "Fli1", "Runx1")
+
+```
+
+# Subclustering, filtering, oh my!
+
+From initial cell counts, recall that some clusters are disproportionately represented by timepoint, dataset, or both. 
+
+```{r count_metrics_by_clusters}
+table(annotated_broad.seurat@meta.data$celltype_short_scvi_0.4_manual, annotated_broad.seurat@meta.data$orig.ident)
+table(annotated_broad.seurat@meta.data$celltype_short_scvi_0.4_manual, annotated_broad.seurat@meta.data$database.id)
+```
+## Subclustering
+
+### Finding new subclusters 
+For the purposes of my project, UBC subtypes will be subclustered according to Calb2 and Grm1. I expect an unequal distribution, with 2/3rds of cells belonging to the Grm1 subtype. 
+
+Notes on subclustering: Future iterations should use the [leiden](https://www.sc-best-practices.org/cellular_structure/clustering.html#key-takeaways) algorithm. Right now it's just giving me a headache. 
+
+Thankfully, Seurat offers the [`FindSubCluster()`](https://satijalab.org/seurat/reference/findsubcluster) function with a leidenalg implementation. 
+
+**Notes about resolution**: As recommended by Seurat, Harvard Bioinformatics Core, and the single-cell best practices book, I've been given the permission structure to futz around with the resolution. From literature, I am looking for 2 subclusters. 
+
+- When resolution = 0.1, 3 subclusters are found, but one of them concerningly has <<50 cells per timepoint and only represents the 4 latest postnatal timepoints: P7, P10, P14, P63 (see `subcluster_test_0.1`)
+- When resolution = 0.06, is the highest resolution that yields 2 clusters, as expected. 
+
+```{r resolution_0.06}
+subcluster_test_0.06 <- FindSubCluster(
+  object = annotated_broad.seurat, 
+  cluster = "UBCs", 
+  graph.name = "RNA_snn",
+  subcluster.name = "ubc.subtype",
+  resolution = 0.06, 
+  algorithm = 1 # 4 = leiden, default = 1 for louvain (which is what was done earlier, later iterations can use leiden)
+)
+
+joined.seurat <- JoinLayers(subcluster_test_0.06)
+Idents(joined.seurat) <- "ubc.subtype"
+
+```
+
+```{r visualize_final_resolution}
+DimPlot(joined.seurat, reduction = "umap.scvi", group.by = "ubc.subtype", label = TRUE, raster = TRUE, raster.dpi = c(1024, 1024))
+table(joined.seurat@meta.data$ubc.subtype, joined.seurat@meta.data$orig.ident)
+
+ubcs_0_cells <- WhichCells(joined.seurat, idents = "UBCs_0") 
+ubcs_1_cells <- WhichCells(joined.seurat, idents = "UBCs_1") 
+
+DimPlot(joined.seurat, cells.highlight = ubcs_0_cells, reduction = "umap.scvi", label = TRUE, repel = TRUE, alpha = 0.1, raster = TRUE, raster.dpi = c(1024, 1024)) 
+
+DimPlot(joined.seurat, cells.highlight = ubcs_1_cells, reduction = "umap.scvi", label = TRUE, repel = TRUE, alpha = 0.1, raster = TRUE, raster.dpi = c(1024, 1024)) 
+
+# UBC subtypes by markers
+FeaturePlot(
+  joined.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Eomes"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE, 
+  raster.dpi = c(1024, 1024)
+)
+
+FeaturePlot(
+  joined.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Calb2", "Plcb1"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE, 
+  raster.dpi = c(1024, 1024)
+)
+
+FeaturePlot(
+  joined.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Grm1", "Plcb4"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE,
+  raster.dpi = c(1024, 1024)
+)
+```
+### Finding markers
+
+```{r subcluster_marker}
+Idents(joined.seurat) <- "celltype_subtyped_scvi_0.4_manual"
+ubc_0_vs_1.conserved_markers <- FindConservedMarkers(
+  joined.seurat,
+  ident.1 = "UBC_calretinin",
+  ident.2 = "UBC_mGLur1a",
+  grouping.var = "orig.ident",
+  # features = c("Eomes", "Calb2", "Grm1", "Plcb1", "Plcb4"),
+) %>%
+    tibble::rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name"))
+for (timepoint in rev_timepoint_order) {
+  cols <- colnames(ubc_0_vs_1.conserved_markers %>%
+                     select(starts_with(timepoint)))
+  if (length(cols) == 5) {
+    cols = cols[rev(1:length(cols))]
+    for (col in cols) {
+      # put all columns with this point at the FRONT
+      ubc_0_vs_1.conserved_markers <- ubc_0_vs_1.conserved_markers %>%
+        relocate(col, .after = gene)
+    }
+  }
+}
+
+ubc_0.conserved_markers <- FindConservedMarkers(
+  joined.seurat,
+  ident.1 = "UBC_calretinin",
+  grouping.var = "orig.ident",
+  # features = c("Eomes", "Calb2", "Grm1", "Plcb1", "Plcb4"),
+) %>%
+    tibble::rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name"))
+for (timepoint in rev_timepoint_order) {
+  cols <- colnames(ubc_0.conserved_markers %>%
+                     select(starts_with(timepoint)))
+  if (length(cols) == 5) {
+    cols = cols[rev(1:length(cols))]
+    for (col in cols) {
+      # put all columns with this point at the FRONT
+      ubc_0.conserved_markers <- ubc_0.conserved_markers %>%
+        relocate(col, .after = gene)
+    }
+  }
+}
+
+ubc_1.conserved_markers <- FindConservedMarkers(
+  joined.seurat,
+  ident.1 = "UBC_mGLur1a",
+  grouping.var = "orig.ident",
+  # features = c("Eomes", "Calb2", "Grm1", "Plcb1", "Plcb4"),
+) %>%
+    tibble::rownames_to_column(var = "gene") %>%
+    left_join(y = unique(annotations[, c("gene_name", "description")]),
+               by = c("gene" = "gene_name"))
+for (timepoint in rev_timepoint_order) {
+  cols <- colnames(ubc_1.conserved_markers %>%
+                     select(starts_with(timepoint)))
+  if (length(cols) == 5) {
+    cols = cols[rev(1:length(cols))]
+    for (col in cols) {
+      # put all columns with this point at the FRONT
+      ubc_1.conserved_markers <- ubc_1.conserved_markers %>%
+        relocate(col, .after = gene)
+    }
+  }
+}
+
+
+ubc_0_vs_1.markers <- FindMarkers(
+  joined.seurat,
+  ident.1 = "UBCs_0",
+  ident.2 = "UBCs_1",
+  features = c("Eomes", "Calb2", "Grm1", "Plcb1", "Plcb4"),
+)
+
+
+colnames_logfc <- grep("avg_log2FC", colnames(ubc_0_vs_1.conserved_markers), value = TRUE)
+
+top25_per_subtype_cluster <- ubc_0_vs_1.conserved_markers %>% 
+  mutate(avg_fc = rowSums(ubc_0_vs_1.conserved_markers[, colnames_logfc], na.rm=TRUE) / length(colnames_logfc))
+```
+
+```{r save_conserved_ubc_subtype}
+write.csv(ubc_0_vs_1.conserved_markers, "data/ubc_0_vs_1_all_conserved_markers.csv", row.names=FALSE)
+write.csv(ubc_0.conserved_markers, "data/ubc_0_vs_1_all_conserved_markers.csv", row.names=FALSE)
+write.csv(ubc_1.conserved_markers, "data/ubc_0_vs_1_all_conserved_markers.csv", row.names=FALSE)
+```
+
+### Visualizing subtypes
+```{r visualizing_subtypes}
+# SUBTYPE MARKERS
+# Calretinin+: Calb2 and Plcb1
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Calb2", "Plcb1"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+
+# mGluR1a+: Grm1 and Plcb4
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Grm1", "Plcb4"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+
+# SUBTYPE I vs. EOMES
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Eomes", "Calb2"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Eomes", "Plcb1"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+
+
+# SUBTYPE II vs EOMES
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Eomes", "Grm1"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Eomes", "Plcb4"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+
+# SUBTYPE I vs II
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Calb2", "Grm1"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+FeaturePlot(
+  annotated_broad.seurat,
+  reduction = "umap.scvi",
+  features = c("Plcb1", "Plcb4"),
+  blend = TRUE,
+  label = TRUE,
+  raster = TRUE,
+)
+
+ubc_0_vs_1.markers <- FindMarkers(
+  annotated_broad.seurat,
+  ident.1 = "UBC_calretinin",
+  ident.2 = "UBC_mGLur1a"
+)
+
+ubc_1_vs_0.markers <- FindMarkers(
+  annotated_broad.seurat,
+  ident.1 = "UBC_mGLur1a",
+  ident.2 = "UBC_calretinin"
+)
+# colnames_logfc <- grep("avg_log2FC", colnames(ubc_0_vs_1.markers), value = TRUE)
+# top25_per_subtype_cluster <- ubc_0_vs_1.markers %>% 
+  # mutate(avg_fc = rowSums(ubc_0_vs_1.markers[, colnames_logfc], na.rm=TRUE) / length(colnames_logfc))
+
+DotPlot(annotated_broad.seurat, features = c("Eomes", "Calb2", "Plcb1", "Grm1", "Plcb4"), idents = c("UBC_calretinin", "UBC_mGLur1a"))
+
+table(annotated_broad.seurat@meta.data$ubc.subtype, annotated_broad.seurat@meta.data$orig.ident)
+table(annotated_broad.seurat@meta.data$ubc.subtype, annotated_broad.seurat@meta.data$database.id)
+
+```
+
+```{r saving_subtype_markers_all}
+write.csv(ubc_0_vs_1.markers, "data/ubc_0_vs_1_all_markers.csv")
+write.csv(ubc_1_vs_0.markers, "data/ubc_1_vs_0_all_markers.csv")
+
+```
+
+
+### Adding subtypes to metadata
+```{r annotating_new_markers}
+joined.seurat <- RenameIdents(joined.seurat, 'UBCs_0' = 'UBC_calretinin', 'UBCs_1' = 'UBC_mGLur1a')
+levels(joined.seurat)
+
+joined.seurat$celltype_subtyped_scvi_0.4_manual <- Idents(joined.seurat)
+Idents(joined.seurat) <- "celltype_short_scvi_0.4_manual"
+```
+
+### Saving/Loading as `annotated_broad.seurat`
+
+```{r saving_loading_subtype_annotations}
+# saveRDS(joined.seurat, "data/annotated_broad_seurat.RDS")
+annotated_broad.seurat <- readRDS("data/annotated_broad_seurat.RDS")
+```
+
+
+```{r subsetting_suboptimal_resolution, eval=FALSE, include=FALSE}
+subcluster_test_0.5 <- FindSubCluster(
+  object = annotated_broad.seurat, 
+  cluster = "UBCs", 
+  graph.name = "RNA_snn",
+  subcluster.name = "ubc.subtype",
+  resolution = 0.5, # default 
+  algorithm = 1 # 4 = leiden, default = 1 for louvain (which is what was done earlier, later iterations can use leiden jesus)
+)
+
+subcluster_test_0.1 <- FindSubCluster(
+  object = annotated_broad.seurat, 
+  cluster = "UBCs", 
+  graph.name = "RNA_snn",
+  subcluster.name = "ubc.subtype",
+  resolution = 0.1, 
+  algorithm = 1 # 4 = leiden, default = 1 for louvain (which is what was done earlier, later iterations can use leiden jesus)
+)
+
+DimPlot(subcluster_test_0.5, reduction = "umap.scvi", group.by = "ubc.subtype", label = TRUE, label.size = 6)
+table(subcluster_test_0.5@meta.data$ubc.subtype, subcluster_test_0.5@meta.data$orig.ident)
+
+DimPlot(subcluster_test_0.1, reduction = "umap.scvi", group.by = "ubc.subtype", label = TRUE, label.size = 6)
+table(subcluster_test_0.1@meta.data$ubc.subtype, subcluster_test_0.1@meta.data$orig.ident)
+
+```
+
+
+## Low quality clusters
+The plan is to subset the final Seurat Object **after** integrating snATAC-seq data. 
+
+## Visualizing marker expression
+For my run, the annotated clusters can be divided as such. Recall that the chosen dimension reduction & resolution is scvi at resolution=0.4: 
+
+1. Of-interest: glutamatergic lineages
+2. To-discard: GABAergic lineages
+3. To-discard: Glial lineages
+4. To-discard: Non-neurals
+5. Definitely discard: Contaiminated/stressed clusters
+
+Given the original list (see Annotation notes section), we will divide the clusters into metaclusters for convenience. 
+
+```{r lineage_meta_clusters}
+annotation_short_scvi_0.4_manual <- c(
+  "GC",
+  "GC_progenitors",
+  "Glial_progenitors",
+  "GC_differentiating",
+  "VZ_progenitors",
+  "Astrocytes_Bergmann_glia",
+  "Interneurons",
+  "Purkinje_cells",
+  "Brainstem_progenitors",
+  "Glutamatergic_CNN",
+  "to-discard_Sepp_specific",
+  "RBC",
+  "RBC",
+  "Neural_stem_cells",
+  "Purkinje_cells",
+  "UBCs",
+  "Neural_progenitor_cells",
+  "Microglia",
+  "RL_progenitors",
+  "Meninges",
+  "GABAergic_CNN",
+  "to-discard_unknown",
+  "Isl1+_mesencephalon_origin_cells",
+  "Endothelial_cells",
+  "to-discard_unknown",
+  "to-discard_unknown",
+  "Mesencephalon_derived_cells",
+  "Pericytes",
+  "Microglia",
+  "to-discard_unknown",
+  "Pericytes",
+  "to-discard_RBC_contaminated_astrocytes",
+  "Oligodendrocytes",
+  "RBC",
+  "Purkinje_cells_mature",
+  "RBC",
+  "Pericytes"
+)
+
+gluta_lineage <- c(
+  "GC",
+  "GC_progenitors",
+  "GC_differentiating",
+  "Glutamatergic_CNN",
+  "Neural_stem_cells",
+  "UBCs",
+  "Neural_progenitor_cells",
+  "RL_progenitors"
+)
+
+GABA_lineage <- c(
+  "VZ_progenitors",
+  "Interneurons",
+  "Purkinje_cells",
+  "Neural_stem_cells",
+  "Purkinje_cells",
+  "Neural_progenitor_cells",
+  "GABAergic_CNN",
+  "Purkinje_cells_mature"
+)
+
+glial_lineage <- c(
+  "Glial_progenitors",
+  "Astrocytes_Bergmann_glia",
+  "Microglia",
+  "Microglia",
+  "Oligodendrocytes"
+)
+
+non_cb_derived <- c(
+  "Brainstem_progenitors",
+  "Isl1+_mesencephalon_origin_cells",
+  "Mesencephalon_derived_cells"
+)
+
+non_neural <- c(
+  "RBC",
+  "RBC",
+  "Meninges",
+  "Endothelial_cells",
+  "Pericytes",
+  "Pericytes",
+  "RBC",
+  "RBC",
+  "Pericytes"
+)
+
+to_discard <- annotation_short_scvi_0.4_manual[grepl("^to-discard", annotation_short_scvi_0.4_manual)]
+```
+
+Purpose of the following plots are to ensure that the metaclusters show expected markers and there are no "ectopic" marker genes. Since this project also traces development, we expect cells with more progenitor markers to coincide with celltypes earlier in development, and markers for developed celltypes for more differentiated ones. In the same vein, we expect cycling cells to be associated with less mature cells, and non-cycling cells to be associated with cells assumed to be non-proliferative. Non-proliferative cells are assumed to be more differentiated and further down the developmental trajectory. 
+
+```{r visualize_key_markers}
+# UBC subtypes
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Eomes", "Calb2", "Plcb1", "Grm1", "Plcb4"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# proposed UBC subtype markers...that aren't as promising
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Barx2", "Npnt", "Neurod4", "Mgarpg"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# CNN
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Tbr1","Pou3f1", "Olig2", "Lhx9"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# GC 
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Pax6", "Mapt", "Nhlh1", "Tubb3"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# Gluta progenitors and Mki67 which marks progenitors
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Pax6", "Atoh1", "Lmx1a", "Mki67"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# Proliferative markers
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Wls", "Nes", "Fgfr4", "Sox2"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# bipotential signaling pathway by Zhang...Hassan et al. (2021)
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Notch1", "Sox2", "Ptf1a", "Atoh1"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# For double-checking Purkinje clusters
+FeaturePlot(
+  annotated_broad.seurat, 
+  reduction = "umap.scvi", 
+  features =  c("Rora", "Calb1", "Foxp2"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+
+```
+## Comparing anchor transfer vs manual labels
+The `broad_seurat` object's predicted cell IDs will be stored as `automated_prediction`.
+```{r auto_vs_manual}
+Idents(object = broad.seurat) <- "predicted.id"
+automated_prediction <- unique(broad.seurat@meta.data$predicted.id)
+gluta_auto_ids <- c("GC", "glut_DN", "NTZ_neuroblast", "NTZ_mixed", "GC/UBC", "UBC")
+
+# automated_gluta
+gluta_auto_cells <- WhichCells(broad.seurat, idents = gluta_auto_ids) 
+DimPlot(broad.seurat, cells.highlight = gluta_auto_cells, reduction = "umap.scvi", label = TRUE, repel = TRUE, alpha = 0.1, raster = TRUE, raster.dpi = c(1024, 1024)) 
+# manual_gluta
+gluta_lineage_cells <- WhichCells(annotated_broad.seurat, idents = gluta_lineage) 
+DimPlot(annotated_broad.seurat, cells.highlight = gluta_lineage_cells, reduction = "umap.scvi", label = TRUE, repel = TRUE, alpha = 0.1, raster = TRUE, raster.dpi = c(1024, 1024)) 
+
+```
+
+If we wanted to remove the potentially stressed cells, we could use the subset() function:
+
+```{r filter_out_bad_clusters}
+subset_annotated_broad.seurat <- subset(annotated_broad.seurat, idents = to_discard, invert = TRUE)
+
+# Re-visualize the clusters
+DimPlot(
+  object = subset_annotated_broad.seurat,
+  reduction = "umap.scvi",
+  label = TRUE,
+  label.size = 3,
+  repel = TRUE,
+  raster = TRUE
+)
+
+```
+
+
+# References
+
+Khouri-Farah, N., Guo, Q., Morgan, K., Shin, J., & Li, J. Y. (2022). Integrated single-cell transcriptomic and epigenetic study of cell state transition and lineage commitment in embryonic mouse cerebellum. Science Advances, 8(13), eabl9156. https://doi.org/10.1126/sciadv.abl9156
+
+Sepp, M., Leiss, K., Murat, F. et al. Cellular development and evolution of the mammalian cerebellum. Nature 625, 788–796 (2024). https://doi.org/10.1038/s41586-023-06884-x
+
+Vladoiu, M.C., El-Hamamy, I., Donovan, L.K. et al. Childhood cerebellar tumours mirror conserved fetal transcriptional programs. Nature 572, 67–73 (2019). https://doi.org/10.1038/s41586-019-1158-7
+
+## Miscellaneous notes
+
+To help with annotation, will look for the following gene markers; 
+
+Look at Allan brain atlas!! 
+E15.5 (E18.5 end up in the same place). Lmx1a "pocket" of Tb2+ cells. Suspected to be UBCs. Very likely that this is where UBC generate and stay.
+- By P4, very low expression of Lmx1a. Suspected to by embryonic gated
+
+Rhombic lip positive for Atoh1, but this Lmx1a pocket has DOWNREG ATOH1 EARLY. 
+
+Wntless expression? 
+
+FACS sorting E9 - E16, whole hindbrain.
+
+- Half expressed Pax6 vs Nestin. They seem negatively correl. Both
+- intermediate progenitor: High Sox2, high nestin, low mki67
+- after cells leave RL: upreg Wntless, downreg Pax6
+
+
+For key markers presented by Vladoiu et al., please see [their extended fig 1c](https://www.nature.com/articles/s41586-019-1158-7/figures/7).
+
+For key markers presented by Sepp et al., please see: 
+- RL/EGL: [Extended fig. 5](https://www.nature.com/articles/s41586-023-06884-x/figures/9)
+
+- Glial: [Extended fig. 10](https://www.nature.com/articles/s41586-023-06884-x/figures/10)

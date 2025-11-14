@@ -1,0 +1,1070 @@
+---
+title: "scATAC_1_preprocessing"
+author: "akrenip"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Purpose 
+This vignette walks through the single-cell ATAC-seq processing needed for GRN construction. Signac, the chromatin analysis package part of the Seurat suite, is the main focus here, but other libraries like ArchR and pycisTopic are also appropriate. This vignette assumes basic knowledge on single-cell genomics and working experience with R. Supplementary readings and pertinent sources will be embedded when relevant. 
+The input of this vignette requires a `fragments.tsv.gz` per sample. 
+Basic data wrangling, quality control, and standard preprocessing steps shown here are a combination of instruction provided by: 
+
+1. For general preprocessing steps, Signac's [merge tutorial](https://stuartlab.org/signac/articles/merging). 
+2. For integration and label transferring, [scANVI's tutorial](https://docs.scvi-tools.org/en/stable/tutorials/notebooks/atac/peakvi_in_R.html). 
+3. For alternative workflows and context, [the online Single-Cell Best Practices textbook by Heumos et al. (2023)](https://www.sc-best-practices.org/chromatin_accessibility/introduction.html).
+
+# Imports
+```{r setup}
+# main bioinformatic libraries
+library(Seurat)
+library(Signac)
+library(SeuratWrappers)
+library(monocle3)
+library(Matrix)
+library(cicero)
+
+# database libraries
+library(EnsDb.Mmusculus.v79)
+library(GenomeInfoDb)
+library(GenomicRanges)
+
+# visualization libraries
+library(ggplot2)
+library(cowplot)
+library(patchwork)
+
+# misc
+library(reticulate)
+library(sceasy)
+library(future)
+
+# settings in-line with node resources requested
+plan("multicore", workers = 4)
+options(future.globals.maxSize = 200000 * 1024^2) # for 200 Gb RAM
+set.seed(1234) 
+```
+
+```{r filepaths}
+macs2.path <- "miniconda-env/macs2-env/bin/macs2"
+e10_p63_filepath <- list.files(path = "E-MTAB-9765_Sarropoulos/", pattern = ".gz$")
+```
+
+# Input
+
+## Creating .tbi files from existing fragment files. 
+
+Currently Sockeye does not come with `gzip()` or `tabix()` function. Currently following the [htslib installation instructions](https://github.com/samtools/htslib/blob/develop/INSTALL) on the v5SeuratSignac/ apptainer. 
+
+```
+module load gcc apptainer
+apptainer shell --writable --fakeroot v5SeuratSignac/
+
+# installing htslib if bgzip and tabix commands are not found
+apt-get update
+apt-get install autoconf automake make gcc perl zlib1g-dev libbz2-dev liblzma-dev libcurl4-gnutls-dev libssl-dev libdeflate-dev
+# 'cd' to the htslib-1.x directory 
+make
+make install
+exit
+# rebuild .sif so that htslib is now in the apptainer
+apptainer build v5SeuratSignac.sif v5SeuratSignac/
+
+# 'cd' to the fragment files that need .tbi files generated
+module load gcc apptainer
+apptainer shell --home /scratch/st-dg0ldo-1/akrenip/my_rstudio --env XDG_CACHE_HOME=/scratch/st-dg0ldo-1/akrenip/my_rstudio /arc/project/st-dg0ldo-1/rstudio/v5SeuratSignac/
+# loop through all files in directory
+for fragments in *; do
+	gzip -d "$fragments"
+done
+
+for fragments in *; do
+	bgzip "$fragments"
+done
+
+for fragments in *; do
+	tabix -p bed "$fragments"
+done
+```
+# Creating barcode, peak, and fragment files for each sample
+
+For each fragment file: 
+  1. Use regex to extract a substring for future filenaming purposes.
+  2. Count all fragments per cell barcode. 
+  3. Filter to keep counts iff cell has over 1000 fragments. Purpose for this specific cutoff is to discard the same "low-quality" cells as [Sarropoulos' workflow, line 65](https://github.com/ioansarr/mouse-cerebellum-atac/blob/master/001_processing_and_annotation/001_ArchR_BarcodeQC.Rmd).
+  4. Of this filtered set, use the cell barcodes (`$CB`) when creating the FragmentObject. 
+create and save a FragmentObject. Code for fragment import is based on [Signac's atac.combined_vignette, particularly line 109](https://github.com/stuart-lab/signac/blob/eecc56f3dd5623d44396abda3c5810e5cc3001ae/vignettes/atac.combined_vignette.Rmd).
+
+Additional notes: 
+The `gsub()` function uses regex to extract a "timepoint_" substring. Note the naming convention Sarropoulos et al. uses `{sample}_{species}_{tissue}_{timepoint}_{sex}_fragments.tsv.gz`
+
+Note the following regex: 
+- For something like "e11_": `timepoint <- gsub(".*Cerebellum_*(.*?)(?:F|M|Mix).*", "\\1", frag_file)`
+- For something like "e11_F_": `timepoint_sex <- gsub(".*Cerebellum_*(.*?)fragments.*", "\\1", frag_file)`
+
+When merging the list of GRangesObjects in `reduce()`, [the `unlist()` and coercing `as()` is needed](https://support.bioconductor.org/p/84087/) to make sure the list of GRanges are taken as a large GRanges object, *and not a list*. 
+
+  ### Looping through each sample
+```{r full_loop}
+granges_list <- c()
+atac_seurat_list <- c()
+
+for (frag_file in e10_p63_filepath) {
+  sample_id <- gsub(".*Cerebellum_*(.*?)_fragments.*", "\\1", frag_file)
+  filepath <- paste0("E-MTAB-9765_Sarropoulos/", frag_file)
+  print(sample_id)
+  
+  total_fragments <- CountFragments(fragments = filepath)
+  saveRDS(total_fragments, paste0("data/counts/", sample_id, "_total_fragments.RDS"))
+
+  barcodes <- total_fragments[total_fragments$frequency_count >= 2500, ]$CB
+  saveRDS(barcodes, paste0("data/barcodes/", sample_id, "_barcodes.RDS"))
+
+  frag_obj <- CreateFragmentObject(path = filepath, cells = barcodes)
+  saveRDS(frag_obj, paste0("data/fragments/", sample_id, "_fragmentobj.RDS"))
+  
+  peaks <- CallPeaks(frag_obj, macs2.path = macs2.path)
+  saveRDS(peaks, paste0("data/peaks/", sample_id, "_peaks.RDS"))
+  granges <- makeGRangesFromDataFrame(peaks)
+  granges_list <- c(granges_list, granges)
+}
+saveRDS(granges_list, "data/granges_list.RDS")
+
+combined.peaks <- reduce(x=unlist(as(granges_list, "GRangesList")))
+# Filter out bad peaks based on length
+peakwidths <- width(combined.peaks)
+combined.peaks <- combined.peaks[peakwidths < 10000 & peakwidths > 20]
+
+frag_objs_files <- list.files(path = "data/fragments/", pattern = ".RDS$")
+list_of_sample_ids <- c()
+for (frag_file in frag_objs_files) {
+  sample_id <- gsub("(.*?)_fragmentobj.*", "\\1", frag_file)
+  total_fragments <- readRDS(paste0("data/counts/", sample_id, "_total_fragments.RDS"))
+  barcodes <- readRDS(paste0("data/barcodes/", sample_id, "_barcodes.RDS"))
+  frag_obj <- readRDS(paste0("data/fragments/", frag_file))
+  
+  # create a matrix of peaks x cell for each sample 
+  counts <- FeatureMatrix(fragments = frag_obj, features = combined.peaks, cells = barcodes)
+  # create ATAC seurat obj
+  chromatin_assay <- CreateChromatinAssay(counts, fragments = frag_obj)
+  atac_seurat <- CreateSeuratObject(chromatin_assay, assay = "ATAC")
+  # add fragment metadata
+  rownames(total_fragments) <- total_fragments$CB
+  atac_seurat$fragments <- total_fragments[colnames(atac_seurat), "frequency_count"]
+  # change sample_id to remove the last underscore
+  sample_id <- gsub("_$", "\\1", sample_id)
+  # add this edited identifier to the object's metadata 
+  atac_seurat$dataset <- sample_id
+  list_of_sample_ids <- c(list_of_sample_ids, sample_id)
+  atac_seurat_list <- c(atac_seurat_list, atac_seurat)
+}
+
+saveRDS(atac_seurat_list, "data/list_of_atac.RDS")
+saveRDS(list_of_sample_ids, "data/list_of_sample_ids.RDS")
+
+# rm(timepoint_sex, filepath, counts, barcodes, frag_obj)
+```
+### Merging ATAC objects
+
+After saving, merge!
+```{r merge_all_seurat}
+# sanity check: atac_seurat_list assumed order is preserved
+i = 0
+for (i in 1:length(list_of_sample_ids)) {
+  print(paste0("sample ", i, ": ", atac_seurat_list[[i]]@meta.data$dataset[[1]] == list_of_sample_ids[[i]]))
+}
+
+atac_seurat_list <- readRDS("data/list_of_atac.RDS")
+list_of_sample_ids <- readRDS("data/list_of_sample_ids.RDS")
+
+atac.combined <- merge(
+  x = atac_seurat_list[[1]],
+  y = atac_seurat_list[-1],
+  add.cell.ids = list_of_sample_ids
+)
+atac.combined[["ATAC"]]
+
+saveRDS(atac.combined, "data/combined_atac_seurat.RDS")
+```
+# Quality control
+Quality control more closely follows the [PeakVI tutorial](). PeakVI is part of the scvi-tools bioinformatics package suite, and, like Signac, is another chromatin accessibility analysis library. 
+
+## Downloading annotations
+If, like me, you are working on an HPC, internet connection is only available on the login node. 
+The function `GetGRangesFromEnsDb` is literally a database query call that needs network connection. 
+```
+library(Signac)
+library(GenomicRanges)
+library(EnsDb.Mmusculus.v79)
+
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "mm10"
+saveRDS(annotations, "data/annotations_atac.RDS")
+```
+
+## Adding QC metrics to metadata
+
+Calculating CellRanger's `peak_region_fragments` from scratch: The number of fragments in peaks. 
+- Please note, that [Signac's `fragments` is equivalent to CellRanger's `passed_filters`](https://github.com/stuart-lab/signac/issues/273), which is represented by nCount_ATAC.
+
+`FRiP()` counts the fraction of reads in peaks for each cell, given a peak/cell assay and a bin/cell assay. 
+(Note that this can be run on a subset of the genome, so that a bin/cell assay does not need to be computed for the whole genome) 
+
+Returns a Seurat object with metadata added corresponding to the fraction of reads in peaks for each cell.
+
+Please note that `peak_region_fragments` is the number of fragments in peaks, which is synonymous as `nCount_`
+```{r atac_qc}
+annotations <- readRDS("data/annotations_atac.RDS")
+# add the gene information to the object
+Annotation(atac.combined) <- annotations
+
+# compute nucleosome signal score per cell
+atac.combined <- NucleosomeSignal(object = atac.combined)
+
+# compute TSS enrichment score per cell
+atac.combined <- TSSEnrichment(object = atac.combined, fast = FALSE)
+
+# compute fraction of blacklisted counts per cell
+atac.combined$blacklist_region_fragments <- FractionCountsInRegion(
+  object = atac.combined, 
+  regions = blacklist_mm10, 
+  assay = 'ATAC'
+)
+
+# compute FRiP (same as pct_reads_in_peaks!)
+atac.combined <- FRiP(
+  object = atac.combined,
+  assay = 'ATAC',
+  total.fragments = 'fragments'
+)
+
+# add fraction of reads in peaks and blacklist ratio
+atac.combined$peak_region_fragments <- colSums(atac.combined@assays$ATAC$counts)
+atac.combined$pct_reads_in_peaks <- atac.combined$nCount_ATAC / atac.combined$fragments * 100
+atac.combined$blacklist_ratio <- atac.combined$blacklist_region_fragments / atac.combined$nCount_ATAC
+
+saveRDS(atac.combined, "data/qc_todo_combined_atac_seurat.RDS")
+# atac.combined <- readRDS("data/qc_todo_combined_atac_seurat.RDS")
+```
+
+```{r visualize_qc_metrics}
+list_of_qc_metrics <- c('nCount_ATAC', 'FRiP', 'TSS.enrichment', 'blacklist_ratio', 'nucleosome_signal')
+options(repr.plot.width=16, repr.plot.height=4)
+VlnPlot(
+  object = atac.combined,
+  features = list_of_qc_metrics,
+  pt.size = 0.01,
+  ncol = 5,
+  raster = TRUE
+)
+
+DensityScatter(atac.combined, x = 'nCount_ATAC', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE)
+```
+
+Follows QC metrics by Sarropoulus et al. (2021) as [detailed in lines 55 to 66](https://github.com/ioansarr/mouse-cerebellum-atac/blob/master/001_processing_and_annotation/001_ArchR_BarcodeQC.Rmd). 
+Taken verbatim from their code: "We will require high quality barcodes to have at least 5,000 fragments and a TSS enrichment of 3".
+
+```
+ArrowFiles <- createArrowFiles(
+  inputFiles = inputFiles,
+  sampleNames = names(inputFiles),
+  filterTSS = 3, 
+  filterFrags = 5000, 
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE,
+  QCDir = "001_barcode_qc",
+  promoterRegion = c(2000,100),
+  removeFilteredCells = T,
+  minFrags = 2500, 
+  force = T
+)
+```
+This function comes from ArchR, another chromatin accessibility analysis package, similar to Signac. Main point being: 
+The upper-bound of peak region fragments (`nCount_ATAC < 100000`) and fraction of region in peaks (`FRiP > 0.4`) is based on workflows by Signac's (adult) mouse brain tutorial and scANVI's guide too. 
+
+```{r qc_filtering}
+atac.filtered <- subset(
+  x = atac.combined,
+  subset = nCount_ATAC >= 5000 &
+    nCount_ATAC < 100000 &
+    FRiP > 0.4 &
+    blacklist_ratio < 0.05 &
+    nucleosome_signal < 4 &
+    TSS.enrichment >= 3
+)
+atac.filtered
+
+saveRDS(atac.filtered, "data/filtered_atac_seurat.RDS")
+# atac.filtered <- readRDS("data/filtered_atac_seurat.RDS")
+```
+
+After filtering, visualize the same QC metrics as a sanity check. 
+```{r filtered_qc_visualize}
+options(repr.plot.width=16, repr.plot.height=4)
+VlnPlot(
+  object = atac.filtered,
+  features = list_of_qc_metrics,
+  pt.size = 0.01,
+  alpha = 0.1,
+  ncol = 5,
+  raster = TRUE
+)
+DensityScatter(atac.filtered, x = 'nCount_ATAC', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE)
+```
+
+# Preprocessing
+Preprocessing involves the following steps: 
+1. Find "highly variables" features. For single-cell ATAC-seq, features refer to peaks (AKA areas of open, nucleosome free chromatin). This is analogous to finding "highly variable genes" in scRNA-seq analysis. 
+2. Perform dimension reduction. scATAC-seq data is both high-dimensional and sparse, being able to "dumb down" genomic data helps with scalability and interpretability. 
+
+```{r process}
+# process the combined dataset
+atac.filtered <- FindTopFeatures(atac.filtered, min.cutoff = 10)
+atac.filtered <- RunTFIDF(atac.filtered)
+atac.filtered <- RunSVD(atac.filtered)
+atac.filtered <- RunUMAP(atac.filtered, reduction = "lsi", dims = 2:30)
+
+saveRDS(atac.filtered, "data/atac_preprocessed.RDS")
+# atac.filtered <- readRDS("data/atac_preprocessed.RDS")
+```
+
+Preliminary coverage plot visualizations for GOI. 
+The two chosen genes of interest, Pax6 and Eomes, are relevant to my cell type of interest, the embryonic cerebellar unipolar brush cell, but these can easily be replaced with GOIs relevant to your research question.
+For context, the unipolar brush cell is a small glutamatergic interneuron. [Pax6 is a transcription factor necessary for the proper development of all glutamatergic lineages in the cerebellum (Yeung et al. 2016)](10.1523/JNEUROSCI.4385-15.2016). [Eomes is also a transcription factor that is a pan-developmental marker of unipolar brush cells (McDonough et al. 2021)](10.3389/fnins.2020.598548).
+```{r coverage plot for GOI}
+coverageplot.Pax6 <- CoveragePlot(
+  object = atac.filtered,
+  group.by = 'dataset',
+  region = "Pax6"
+)
+coverageplot.Pax6
+
+coverageplot.Eomes <- CoveragePlot(
+  object = atac.filtered,
+  group.by = 'dataset',
+  region = "Eomes"
+)
+coverageplot.Eomes
+```
+
+
+# Integration
+
+Following [Signac's tutorial](https://stuartlab.org/signac/articles/integrate_atac#integration). 
+
+## Preamble on integration
+From the [Signac tutorial](https://stuartlab.org/signac/articles/integrate_atac#integration), recall that **integration anchors** are found by first projecting the merged datasets into a *shared low-dimensional space*. 
+
+If **LSI** (latent semantic indexing) is a method of dimension reduction where a set of similar concepts/topics are found within a dataset (which can be seen as a collection of terms and documents), then **reciprocal LSI** projects each dataset into the LSI space of other datasets. 
+
+scATAC-seq is characterized by a very sparse matrix with many features. Therefore, following the advice from Signac's tutorial, I will integrate the low-dimensional cell embeddings (aka LSI coordinates). For reference, scRNA-seq usually integrates the normalized data matrix. 
+
+## ATAC timepoint integration
+
+```{r integration_within_atac_timepoints}
+# find integration anchors
+atac_seurat_list <- SplitObject(atac.filtered, split.by = "dataset")
+
+for (atac_obj in atac_seurat_list) {
+  DefaultAssay(atac_obj) <- "ATAC"
+  atac_obj <- FindTopFeatures(atac_obj, min.cutoff = 10)
+  atac_obj <- RunTFIDF(atac_obj)
+  atac_obj <- RunSVD(atac_obj)
+}
+# saveRDS(atac_seurat_list, "data/list_of_atac.RDS")
+atac_seurat_list <- readRDS("data/list_of_atac.RDS")
+
+integration.anchors <- FindIntegrationAnchors(
+  object.list = atac_seurat_list,
+  anchor.features = rownames(atac.filtered),
+  reduction = "rlsi",
+  dims = 2:30
+)
+
+saveRDS(integration.anchors, "data/integration_anchors.RDS")
+
+# integrate LSI embeddings
+integrated.atac <- IntegrateEmbeddings(
+  anchorset = integration.anchors,
+  reductions = atac.filtered[["lsi"]],
+  new.reduction.name = "integrated_lsi",
+  dims.to.integrate = 1:30
+)
+
+# create a new UMAP using the integrated embeddings
+integrated.atac <- RunUMAP(integrated.atac, reduction = "integrated_lsi", dims = 2:30)
+
+saveRDS(integrated.atac, "data/integrated_atac.RDS")
+```
+
+Visualization of Merged vs Integrated and first LSI component
+
+The first LSI component often captures sequencing depth (a technical variation) rather than meaningful biological variation. By assessing the correlation between sequencing depth and component number. Since the 1st component (leftmost) is so close to -1, this component should be excluded from downstream analysis!
+
+```{r visualization_atac_process}
+DepthCor(integrated.atac)
+
+p1 <- DimPlot(atac.filtered, group.by = "dataset")
+p2 <- DimPlot(integrated.atac, group.by = "dataset")
+
+(p1 + ggtitle("Merged")) | (p2 + ggtitle("Integrated"))
+```
+
+### RNA & ATAC Integration
+
+Done via [Seurat's RNA/ATAC integration tutorial](https://satijalab.org/seurat/articles/seurat5_atacseq_integration_vignette#identifying-anchors-between-scrna-seq-and-scatac-seq-datasets).
+
+Signac's GeneActivity() function infers transcriptional activity of each gene according to nCount_ATAC at the TSS and gene body. 
+
+```{r rna_atac_integration}
+# quantify gene activity
+rna.seurat <- readRDS("data/annotated_broad_seurat.RDS")
+
+gene.activities <- GeneActivity(integrated.atac, features = VariableFeatures(rna.seurat))
+
+# add gene activities as a new assay
+integrated.atac[["ACTIVITY"]] <- CreateAssayObject(counts = gene.activities)
+
+# normalize gene activities
+DefaultAssay(integrated.atac) <- "ACTIVITY"
+integrated.atac <- NormalizeData(integrated.atac)
+integrated.atac <- ScaleData(integrated.atac, features = rownames(integrated.atac))
+
+# Identify anchors
+transfer.anchors <- FindTransferAnchors(reference = rna.seurat, query = integrated.atac, features = VariableFeatures(object = rna.seurat),
+    reference.assay = "RNA", query.assay = "ACTIVITY", reduction = "cca")
+
+```
+
+#### Annotation from RNA
+
+```{r label_transfer}
+celltype.predictions <- TransferData(anchorset = transfer.anchors, refdata = rna.seurat$celltype_short_scvi_0.4_manual,
+    weight.reduction = integrated.atac[["integrated_lsi"]], dims = 2:30)
+integrated.atac <- AddMetaData(integrated.atac, metadata = celltype.predictions)
+```
+
+#### Saving/loading integrated object
+```{r save_load_integrated}
+Idents(integrated.atac) <- "predicted.id"
+saveRDS(integrated.atac, "data/integrated_rna_atac.RDS")
+# integrated.atac <- readRDS("data/integrated_rna_atac.RDS")
+```
+
+# Trajectory analysis
+
+## Filtering dataset by cell type lineage
+
+For pseudotime analysis and later GRN synthesis, working with single lineages work best. For the purposes of this project, granule cells, cerebellar nuclei neurons, and unipolar brush cells will be represented as 3 lineages, and the purkinje lineage will also be used as a negative control. 
+
+```{r cell_type_lineage_list}
+cnn_lineage <- c(
+  "Glutamatergic_CNN",
+  "RL_progenitors"
+)
+
+gc_lineage <- c(
+  "GC",
+  "GC_progenitors",
+  "GC_differentiating",
+  "RL_progenitors"
+)
+
+ubc_lineage <- c(
+  "UBCs",
+  "RL_progenitors"
+)
+
+gluta_lineage <- c(
+  "RL_progenitors", 
+  "GC",
+  "GC_progenitors",
+  "GC_differentiating",
+  "Glutamatergic_CNN",
+  "UBCs"
+)
+
+purkinje_lineage <- c(
+  "Purkinje_cells",
+  "VZ_progenitors",
+  "Purkinje_cells_mature"
+)
+
+GABA_lineage <- c(
+  "VZ_progenitors",
+  "Interneurons",
+  "Purkinje_cells",
+  "Purkinje_cells",
+  "GABAergic_CNN",
+  "Purkinje_cells_mature"
+)
+
+glial_lineage <- c(
+  "Glial_progenitors",
+  "Astrocytes_Bergmann_glia",
+  "Microglia",
+  "Microglia",
+  "Oligodendrocytes"
+)
+
+non_cb_derived <- c(
+  "Brainstem_progenitors",
+  "Isl1+_mesencephalon_origin_cells",
+  "Mesencephalon_derived_cells"
+)
+
+non_neural <- c(
+  "RBC",
+  "RBC",
+  "Meninges",
+  "Endothelial_cells",
+  "Pericytes",
+  "Pericytes",
+  "RBC",
+  "RBC",
+  "Pericytes"
+)
+```
+
+With the lineages defined as a set of annotated celltypes, now we can subset our integrated object accordingly. 
+
+```{r subset_lineage}
+# subset based on cell type
+cnn <- integrated.atac[, integrated.atac$predicted.id %in% cnn_lineage]
+gc <- integrated.atac[, integrated.atac$predicted.id %in% gc_lineage]
+ubc <- integrated.atac[, integrated.atac$predicted.id %in% ubc_lineage]
+
+purkinje <- integrated.atac[, integrated.atac$predicted.id %in% purkinje_lineage]
+
+gluta_meta <- integrated.atac[, integrated.atac$predicted.id %in% gluta_lineage]
+
+gaba_meta <- integrated.atac[, integrated.atac$predicted.id %in% GABA_lineage]
+
+glial_meta <- integrated.atac[, integrated.atac$predicted.id %in% glial_lineage]
+
+lineages <- c(cnn, gc, ubc, gluta_meta, purkinje, gaba_meta, glial_meta)
+lineage_name <- c("cnn_trajectory", "gc_trajectory", "ubc_trajectory", "gluta_meta_trajectory", "purkinje_trajectory", "gaba_meta_trajectory", "glial_meta_trajectory")
+```
+
+## Creating pseudotime trajectories
+
+### Visualizing key markers
+For reference, visualize the transferred labels from scRNA-seq dataset
+```{r markers_for_lineage}
+# CNN
+FeaturePlot(
+  cnn, 
+  reduction = "umap", 
+  features =  c("Tbr1","Pou3f1", "Olig2", "Lhx9"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+) 
+
+# GC 
+FeaturePlot(
+  gc, 
+  reduction = "umap", 
+  features =  c("Pax6", "Mapt", "Nhlh1", "Tubb3"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# UBC subtypes
+FeaturePlot(
+  ubc, 
+  reduction = "umap", 
+  features =  c("Eomes", "Calb2", "Plcb1", "Grm1", "Plcb4"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# Gluta progenitors and Mki67 which marks progenitors
+FeaturePlot(
+  gluta_meta, 
+  reduction = "umap", 
+  features =  c("Pax6", "Atoh1", "Lmx1a", "Mki67"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# Proliferative markers
+FeaturePlot(
+  ubc, 
+  reduction = "umap", 
+  features =  c("Wls", "Nes", "Fgfr4", "Sox2"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# bipotential signaling pathway by Zhang...Hassan et al. (2021)
+FeaturePlot(
+  ubc, 
+  reduction = "umap", 
+  features =  c("Notch1", "Sox2", "Ptf1a", "Atoh1"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+# For double-checking Purkinje clusters
+FeaturePlot(
+  purkinje, 
+  reduction = "umap", 
+  features =  c("Rora", "Calb1", "Foxp2"), 
+  label = TRUE,
+  repel = TRUE, 
+  raster = TRUE
+)
+
+```
+
+```{r labeled_dimplot}
+DimPlot(cnn, group.by = "predicted.id", label = TRUE) + NoLegend() + ggtitle("Cerebellar nuclei neuron label transfer")
+
+DimPlot(gc, group.by = "predicted.id", label = TRUE) + NoLegend() + ggtitle("Granule cell label transfer")
+
+DimPlot(ubc, group.by = "predicted.id", label = TRUE) + NoLegend() + ggtitle("Unipolar brush cell label transfer")
+
+DimPlot(gluta_meta, group.by = "predicted.id", label = TRUE) + NoLegend() + ggtitle("Unipolar brush cell label transfer")
+
+DimPlot(purkinje, group.by = "predicted.id", label = TRUE) + NoLegend() + ggtitle("Purkinje cell label transfer")
+
+DimPlot(gaba_meta, group.by = "predicted.id", label = TRUE) + NoLegend() + ggtitle("Unipolar brush cell label transfer")
+
+DimPlot(glial_meta, group.by = "predicted.id", label = TRUE) + NoLegend() + ggtitle("Unipolar brush cell label transfer")
+
+
+```
+
+### Creating trajectories for each lineage of interest
+```{r trajectory_loop}
+# create celldataset objects
+i = 0
+for (lineage in lineages) {
+  i <- i + 1
+  cds <- as.cell_data_set(lineage)
+  cds <- cluster_cells(cds = cds, reduction_method = "UMAP")
+  cds <- learn_graph(cds, use_partition = TRUE)
+  # will trigger interactive map
+  print(paste0("Please choose root node for: ", lineage_name[i]))
+  cds <- order_cells(cds, reduction_method = "UMAP")
+  # plot trajectory for this lineage of interest
+  plot_cells(
+    cds = cds,
+    color_cells_by = "pseudotime",
+    show_trajectory_graph = TRUE
+  )
+  integrated.atac <- AddMetaData(
+    object = integrated.atac, 
+    metadata = cds@principal_graph_aux@listData$UMAP$pseudotime,
+    col.name = lineage_name[i]
+  )
+  cds <- NULL
+}
+
+```
+
+```{r visualize_trajectory}
+# comparing UBCs to other cell types
+FeaturePlot(integrated.atac, c("ubc_trajectory", "cnn_trajectory"), pt.size = 0.1) & scale_color_viridis_c(option = "plasma")
+FeaturePlot(integrated.atac, c("ubc_trajectory", "gc_trajectory"), pt.size = 0.1) & scale_color_viridis_c(option = "plasma")
+
+# comparing ubc to purkinje
+FeaturePlot(integrated.atac, c("ubc_trajectory", "purkinje_trajectory"), pt.size = 0.1) & scale_color_viridis_c(option = "plasma")
+
+# comparing gluta to gaba meta lineages
+FeaturePlot(integrated.atac, c("gluta_meta_trajectory", "gaba_meta_trajectory"), pt.size = 0.1) & scale_color_viridis_c(option = "plasma")
+
+# comparing gluta to glial meta lineages
+FeaturePlot(integrated.atac, c("gluta_meta_trajectory", "glial_meta_trajectory"), pt.size = 0.1) & scale_color_viridis_c(option = "plasma")
+
+# baseline, all cell types according to this ATAC-based UMAP
+
+FeaturePlot(integrated.atac, pt.size = 0.1, label = TRUE, raster = TRUE, raster.dpi = c(1024, 1024)) & scale_color_viridis_c(option = "plasma")
+
+```
+
+```{r saving_loading_trajectory_obj}
+saveRDS(integrated.atac, "data/trajectory_atac_rna_seurat.RDS")
+# integrated.atac <- readRDS("data/trajectory_atac_rna_seurat.RDS")
+```
+
+# Finding co-accessible networks via Cicero
+
+## Notes on parameters
+`s` is the power law value. A constant that represents the power-law distribution of contact frequencies between different locations of the genome as a function of linear distances. The default $0.75$ is based on the "tension globule" polymer model of DNA proposed by Sanborn et al. (2015)
+
+`distance_constraint` or `distance_parameter` is calculated from `estimte_distnce_parameter` function just prior. Its purpose is to provide distance-based penalties. 
+
+`window` is the size (in base pairs) of genomic window to query.
+
+`max_elements` (not shown) it the max number of elements allowed per window. Prevents large models from slowing performance. Default is 200. 
+
+`distance_parameter`: Distance based penalty parameter value. **Generally, the mean of the calculated distance_parameter values from estimate_distance_parameter.**
+
+```{r add_genome_info}
+DefaultAssay(integrated.atac) <- 'ATAC'
+# change to UCSC style since the data was mapped to mm10
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <- "mm10"
+
+# add the gene information to the object
+Annotation(integrated.atac) <- annotations
+
+```
+
+
+```{r cicero_prep}
+# convert to CellDataSet format and make the cicero object
+integrated_trajectory.cds <- as.cell_data_set(x = integrated.atac)
+integrated_trajectory.cicero <- make_cicero_cds(integrated_trajectory.cds, reduced_coordinates = reducedDims(integrated_trajectory.cds)$UMAP)
+
+# saveRDS(integrated_trajectory.cicero, "data/integrated_trajectory_cicero.RDS")
+integrated_trajectory.cicero <- readRDS("data/integrated_trajectory_cicero.RDS")
+```
+## Run Cicero (iteratively)
+```{r run cicero}
+# convert chromosome sizes to a dataframe
+genome <- seqlengths(annotations)
+genome.df <- data.frame("chr" = names(genome), "length" = genome)
+
+s <- 0.75
+distance_constraint <- 250000
+window <- 5e+05
+
+distance_parameters <- estimate_distance_parameter(integrated_trajectory.cicero, 
+                            s = s, 
+                            distance_constraint = distance_constraint,
+                            window = window,
+                            genomic_coords = genome.df)
+saveRDS(distance_parameters, "data/cicero_distance_parameters.RDS")
+
+mean_distance_parameter <- mean(distance_parameters)
+saveRDS(mean_distance_parameter, "data/cicero_mean_distance_parameter.RDS")
+
+# RUN ITERATIVELY
+cicero_cons <- data.frame()
+for (chromosome in genome.df$chr) {
+  subset_genome <- subset(genome.df, chr == chromosome)
+  model_output <- generate_cicero_models(integrated_trajectory.cicero,
+                       mean_distance_parameter,
+                       s = s,
+                       window = window,
+                       genomic_coords = subset_genome)
+  saveRDS(model_output, paste0("data/cicero_model_output_", chromosome, ".RDS"))
+  chr_conns <- assemble_connections(model_output)
+  saveRDS(chr_conns, paste0("data/cicero_conns_", chromosome, ".RDS"))
+  cicero_cons <- rbind(cicero_cons, chr_conns)
+}
+head(cicero_cons)
+
+cicero_cons <- data.frame()
+for (chromosome in chr_list) {
+  chr_conns <- readRDS(paste0("data/cicero_conns_", chromosome, ".RDS"))
+  cicero_cons <- rbind(cicero_cons, chr_conns)
+  print(paste0("Binding ", chromosome))
+}
+saveRDS(cicero_cons, "data/cicero_cons_full")
+head(cicero_cons)
+```
+
+# Find cis-coaccessible networks (CCANs)
+`conns` represents pairwise coaccessibility scores for each peak. CCANs represent groups of coaccessibiliy scores. 
+
+```{r create ccans}
+ccans <- generate_ccans(cicero_cons)
+
+saveRDS(ccans, "data/cicero_ccans.RDS")
+head(ccans)
+```
+
+# Add links to a Seurat object
+Add coaccessible links to the ChromatinAssay object in Seurat. 
+```{r add to Seurat object}
+links <- ConnectionsToLinks(conns = cicero_cons, ccans = ccans)
+Links(integrated.atac) <- links
+
+saveRDS(integrated.atac, "data/cicero_atac_seurat.RDS")
+```
+
+## Visualize links to key UBC markers 
+
+In addition to Pax6 and Eomes, Atoh1 has been added here as an additional GOI. Atoh1 is upstream of Pax6, and marks glutamatergic progenitors that are less fate-determined than Pax6+ progenitors. 
+Please see [Yeung et al.'s (2024) section on cerebellar development in a cell-specific context](https://link.springer.com/rwe/10.1007/978-3-030-23810-0_15).
+
+```{r visualize links ubc}
+# Atoh1
+CoveragePlot(integrated.atac, idents = c("Rhombic Lip Progenitors (Glutamatergic)", "Unipolar Brush Cell Progenitors"), region = "Atoh1", extend.upstream = 1000,
+  extend.downstream = 1000)
+
+# Pax6
+CoveragePlot(integrated.atac, idents = c("Rhombic Lip Progenitors (Glutamatergic)", "Unipolar Brush Cell Progenitors"), region = "Pax6", extend.upstream = 1000,
+  extend.downstream = 1000)
+
+# Eomes
+CoveragePlot(integrated.atac, idents = c("Rhombic Lip Progenitors (Glutamatergic)", "Unipolar Brush Cell Progenitors"), region = "Eomes", extend.upstream = 1000,
+  extend.downstream = 1000)
+
+```
+
+# Prepping Cicero connections and peak names for CellOracle
+Finally, we are at the desired output for GRN construction. CellOracle, a GRN inference algorithm, requires scATAC-seq peaks to be represented as co-accessible regions on the chromosome. This is to allow CellOracle to infer transcription factor-to-cisregulatory element-to-gene connections. 
+```{r prep_for_celloracle}
+all_peaks <- row.names(exprs(integrated_trajectory.cicero))
+write.csv(x = all_peaks, file = "data/all_peaks.csv")
+write.csv(x = cicero_cons, file = "data/cicero_connections.csv")
+```
+
+```
+library(reticulate)
+library(sceasy)
+rna.seurat <- readRDS("data/annotated_broad_seurat.RDS")
+atac.seurat <- readRDS("data/cicero_atac_seurat.RDS")
+use_python("/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/scanvi-env/bin/python3.12", required=TRUE)
+sc <- import("scanpy", convert = FALSE)
+scvi <- import("scvi", convert = FALSE)
+
+# please see https://github.com/cellgeni/sceasy/issues/82#issuecomment-2033118113 for "downgrading" seurat object
+rna.seurat[["RNA"]] <- as(rna.seurat[["RNA"]], "Assay")
+rna_adata <- convertFormat(rna.seurat, from="seurat", to="anndata", main_layer="counts", assay="RNA", drop_single_values=FALSE, outFile="data/rna_adata.h5ad")
+atac_adata <- convertFormat(atac.seurat, from="seurat", to="anndata", main_layer="counts", assay="ATAC", drop_single_values=FALSE, outFile="data/atac_adata.h5ad")
+```
+
+```
+> print(atac_adata)
+AnnData object with n_obs × n_vars = 75100 × 375971
+    obs: 'orig.ident', 'nCount_ATAC', 'nFeature_ATAC', 'fragments', 'dataset', 'nucleosome_signal', 'nucleosome_percentile', 'TSS.enrichment', 'TSS.percentile', 'blacklist_region_fragments', 'FRiP', 'pct_reads_in_peaks', 'blacklist_ratio', 'nCount_ACTIVITY', 'nFeature_ACTIVITY', 'predicted.id', 'prediction.score.to.discard_unknown', 'prediction.score.Mesencephalon_derived_cells', 'prediction.score.Neural_progenitor_cells', 'prediction.score.GC_progenitors', 'prediction.score.GABAergic_CNN', 'prediction.score.Glutamatergic_CNN', 'prediction.score.Neural_stem_cells', 'prediction.score.Brainstem_progenitors', 'prediction.score.Interneurons', 'prediction.score.Pericytes', 'prediction.score.RBC', 'prediction.score.Astrocytes_Bergmann_glia', 'prediction.score.Purkinje_cells', 'prediction.score.UBCs', 'prediction.score.Glial_progenitors', 'prediction.score.Microglia', 'prediction.score.VZ_progenitors', 'prediction.score.RL_progenitors', 'prediction.score.Endothelial_cells', 'prediction.score.Isl1._mesencephalon_origin_cells', 'prediction.score.Purkinje_cells_mature', 'prediction.score.GC_differentiating', 'prediction.score.to.discard_RBC_contaminated_astrocytes', 'prediction.score.to.discard_Sepp_specific', 'prediction.score.GC', 'prediction.score.Meninges', 'prediction.score.Oligodendrocytes', 'prediction.score.max', 'cnn_trajectory', 'gc_trajectory', 'ubc_trajectory', 'gluta_meta_trajectory', 'gaba_meta_trajectory', 'glial_meta_trajectory', 'purkinje_trajectory'
+    var: 'name'
+    obsm: 'X_integrated_lsi', 'X_umap'
+> print(rna_adata)
+AnnData object with n_obs × n_vars = 167921 × 24811
+    obs: 'orig.ident', 'nCount_RNA', 'nFeature_RNA', 'orig_cluster', 'orig_sub_cluster', 'broad_lineage', 'author_cell_type', 'dev_state', 'subtype', 'precisest_label', 'tissue_id', 'batch', 'size_factor', 'donor_id', 'assay_ontology_term_id', 'cell_type_ontology_term_id', 'development_stage_ontology_term_id', 'disease_ontology_term_id', 'self_reported_ethnicity_ontology_term_id', 'organism_ontology_term_id', 'sex_ontology_term_id', 'tissue_ontology_term_id', 'suspension_type', 'is_primary_data', 'tissue_fragment', 'author_stage', 'individual_id', 'tissue_type', 'cell_type', 'assay', 'disease', 'organism', 'sex', 'tissue', 'self_reported_ethnicity', 'development_stage', 'observation_joinid', 'database.id', 'percent_mito', 'mitoRatio', 'percent_ribo', 'percent_hb', 'percent_platlet', 'log10GenesPerUMI', 'S.Score', 'G2M.Score', 'Phase', 'old.ident', 'CC.Difference', 'unintegrated_res.0.2', 'unintegrated_res.0.4', 'unintegrated_res.0.6', 'unintegrated_res.0.8', 'unintegrated_res.1.0', 'unintegrated_res.1.4', 'seurat_clusters', 'harmony_full_res.0.2', 'harmony_full_res.0.4', 'harmony_full_res.0.6', 'harmony_full_res.0.8', 'harmony_full_res.1.0', 'harmony_full_res.1.4', 'scvi_full_res.0.2', 'scvi_full_res.0.4', 'scvi_full_res.0.6', 'scvi_full_res.0.8', 'scvi_full_res.1.0', 'scvi_full_res.1.4', 'predicted.id', 'prediction.score.interneuron', 'prediction.score.parabrachial', 'prediction.score.MBO', 'prediction.score.astroglia', 'prediction.score.Purkinje', 'prediction.score.GABA_DN', 'prediction.score.isth_N', 'prediction.score.GC', 'prediction.score.glut_DN', 'prediction.score.VZ_neuroblast', 'prediction.score.NTZ_mixed', 'prediction.score.erythroid', 'prediction.score.GC.UBC', 'prediction.score.noradrenergic', 'prediction.score.NTZ_neuroblast', 'prediction.score.oligo', 'prediction.score.immune', 'prediction.score.ependymal', 'prediction.score.mural.endoth', 'prediction.score.meningeal', 'prediction.score.UBC', 'prediction.score.neural_crest_progenitor', 'prediction.score.motorneuron', 'prediction.score.max', 'celltype_full_scvi_0.4_manual', 'celltype_short_scvi_0.4_manual', 'ubc.subtype', 'celltype_subtyped_scvi_0.4_manual'
+    var: 'vf_vst_counts.Sepp_2024_mean', 'vf_vst_counts.Sepp_2024_variance', 'vf_vst_counts.Sepp_2024_variance.expected', 'vf_vst_counts.Sepp_2024_variance.standardized', 'vf_vst_counts.Sepp_2024_variable', 'vf_vst_counts.Sepp_2024_rank', 'vf_vst_counts.Carter_GSE224466_mean', 'vf_vst_counts.Carter_GSE224466_variance', 'vf_vst_counts.Carter_GSE224466_variance.expected', 'vf_vst_counts.Carter_GSE224466_variance.standardized', 'vf_vst_counts.Carter_GSE224466_variable', 'vf_vst_counts.Carter_GSE224466_rank', 'vf_vst_counts.Vladoiu_GSE118068_mean', 'vf_vst_counts.Vladoiu_GSE118068_variance', 'vf_vst_counts.Vladoiu_GSE118068_variance.expected', 'vf_vst_counts.Vladoiu_GSE118068_variance.standardized', 'vf_vst_counts.Vladoiu_GSE118068_variable', 'vf_vst_counts.Vladoiu_GSE118068_rank', 'var.features', 'var.features.rank'
+    obsm: 'X_pca.subset.cc', 'X_pca.cc.difference', 'X_umap.unintegrated', 'X_integrated.harmony', 'X_umap.harmony', 'X_integrated.scvi', 'X_umap.scvi'
+>
+
+```
+
+
+## Run Cicero (at once)
+Admittedly, Cicero is a memory-hungry. If your resources are beefy enough, please be my guest. 
+```{r run_all_cicero}
+# RUN WHOLE
+# run cicero
+# conns <- run_cicero(integrated_trajectory.cicero, genomic_coords = genome.df, sample_num = 100)
+# saveRDS(conns, "data/cicero_conns.RDS")
+# head(cicero_cons)
+```
+
+# Integration with scVI and scANVI
+
+Uses [scANVI](https://docs.scvi-tools.org/en/stable/tutorials/notebooks/atac/peakvi_in_R.html#dimensionality-reduction-peakvi) instead of Signac's integration methods. Based on [rankings from this benchmarking paper for both scRNA- and scATAC-seq](https://www.nature.com/articles/s41592-021-01336-8#Fig4).
+
+```{r peakVI_workflow}
+# use_python("/home/akrenip/.local/share/r-miniconda/envs/r-reticulate/bin/python3.10")
+# use_python("/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/scanvi-env/bin/python3.12")
+sc <- import("scanpy", convert = FALSE)
+scvi <- import("scvi", convert = FALSE) 
+
+# load necessary data
+atac.filtered <- readRDS("data/filtered_atac_seurat.RDS")
+atac.filtered
+```
+
+The following needs to be performed in an interactive node, and with a separate scANVI conda environment. 
+
+```
+module load gcc apptainer
+cd /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/
+# submit an interactive job
+salloc --time=24:0:0 --mem=128G --nodes=1 --ntasks=2 --cpus-per-task=8 --account=st-dg0ldo-1
+apptainer shell --home /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing --env XDG_CACHE_HOME=/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/ /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/miniconda.sif
+source activate /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/scanvi-env/
+R
+# import libraries
+library(Seurat)
+library(Signac)
+library(EnsDb.Mmusculus.v79)
+library(ggplot2)
+library(cowplot)
+library(GenomicRanges)
+library(future)
+library(GenomeInfoDb)
+library(patchwork)
+library(reticulate)
+library(sceasy)
+plan("multicore", workers = 4)
+options(future.globals.maxSize = 100000 * 1024^2) # for 100 Gb RAM
+set.seed(1234)
+
+# load necessary Python libraries via reticulate
+use_python("/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/scanvi-env/bin/python3.12", required=TRUE)
+use_python("/arc/project/st-dg0ldo-1/rstudio/v5SeuratSignacScanvi/opt/conda/bin/python3.12", required=TRUE)
+sc <- import("scanpy", convert = FALSE)
+scvi <- import("scvi", convert = FALSE) 
+
+# load necessary data
+atac.filtered <- readRDS("data/filtered_atac_seurat.RDS")
+atac.filtered
+
+# convert seurat obj to anndata
+adata <- convertFormat(atac.filtered, from="seurat", to="anndata", main_layer="counts", assay="ATAC", drop_single_values=FALSE)
+print(adata)
+
+# saving/loading adata
+py_save_object(adata, filename, pickle = "pickle", ...)
+adata <- py_load_object(filename, pickle = "pickle", ..., convert = TRUE)
+
+scvi$model$PEAKVI$setup_anndata(adata)
+pvi <- scvi$model$PEAKVI(adata)
+pvi$train()
+# get  latent represenation
+latent = pvi$get_latent_representation()
+
+# add to seurat
+latent <- as.matrix(latent)
+rownames(latent) = colnames(atac.filtered)
+ndims <- ncol(latent)
+atac.filtered[["peakvi"]] <- CreateDimReducObject(embeddings = latent, key = "peakvi_", assay = "peaks")
+saveRDS(atac.filtered, "data/peakvi_atac_seurat.RDS")
+
+# find clusters, visualize with UMAP
+atac.filtered <- FindNeighbors(atac.filtered, reduction = "peakvi", dims=1:ndims)
+names(atac.filtered@graphs)
+# TODO: STOP HERE. check for "nn" using names()
+atac.filtered <- FindClusters(atac.filtered, graph.name = "", resolution = 1)
+
+atac.filtered <- RunUMAP(atac.filtered, reduction = "peakvi", dims=1:ndims)
+saveRDS(atac.filtered, "data/peakvi_atac_seurat.RDS")
+```
+## Using scVI and scANVI
+Convert seurat object to anndata via sceasy again. Purpose here is to  pretrain via scVI then run scANVI.
+`GeneActivity()` approximates a gene expression matrix by calculating counts per cell in a gene body (all exon + intron) and promoter regions.
+
+This is for non-multiomic samples (i.e. scATAC and scRNA aren't acquired from the same cells). [Even partial matches would work](https://docs.scvi-tools.org/en/stable/tutorials/notebooks/atac/peakvi_in_R.html#create-a-gene-activity-matrix). 
+
+```
+# add gene activity matrix to seurat as a NEW assay and normalize it
+gene.activities <- GeneActivity(atac.filtered)
+
+atac.filtered[['RNA']] <- CreateAssayObject(counts = gene.activities)
+atac.filtered <- NormalizeData(
+  object = atac.filtered,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(atac.filtered$nCount_RNA)
+)
+DefaultAssay(atac.filtered) <- "RNA"
+
+# load annotations from scRNA_seq preprocessing
+rna.seurat <- readRDS("data/annotated_broad_seurat.RDS")
+adata_rna <- convertFormat(rna.seurat, from="seurat", to="anndata", main_layer="counts", assay="RNA", drop_single_values=FALSE)
+adata_atac_act <- convertFormat(atac.filtered, from="seurat", to="anndata", main_layer="counts", assay="RNA", drop_single_values=FALSE)
+
+# provide adata_atac_act unknown cell type labels
+adata_atac_act$obs$insert(adata_atac_act$obs$shape[1], "celltype_short_scvi_0.4_manual", "Unknown")
+
+adata_both <- adata_rna$concatenate(adata_atac_act)
+# “batch” shows which dataset each cell originated from
+head(py_to_r(adata_both$obs))
+
+sc$pp$highly_variable_genes(
+    adata_both, 
+    flavor="seurat_v3", 
+    n_top_genes=r_to_py(3000), 
+    batch_key="batch", 
+    subset=TRUE
+)
+scvi$model$SCVI$setup_anndata(adata_both, labels_key="celltype_short_scvi_0.4_manual", batch_key="batch")
+
+model <- scvi$model$SCVI(adata_both, gene_likelihood="nb", dispersion="gene-batch")
+model$train()
+
+lvae <- scvi$model$SCANVI$from_scvi_model(model, "Unknown", adata=adata_both)
+lvae$train(max_epochs = as.integer(100), n_samples_per_label = as.integer(100))
+
+adata_both$obs$insert(adata_both$obs$shape[1], "predicted.labels", lvae$predict())
+df <- py_to_r(adata_both$obs)
+df <- subset(df, batch == 1)[, c("predicted.labels")]
+atac.filtered <- AddMetaData(object = atac.filtered, metadata = df, col.name="predicted.labels")
+saveRDS(atac.filtered, "data/rna_atac_seurat.RDS")
+```
+## Visualization from interactive node
+
+```{r visualization_from_interactive_node}
+# STANDARD PEAKVI PREPROCESSING UMAP
+
+options(repr.plot.width=7, repr.plot.height=7)
+atac.seurat <- readRDS("data/peakvi_atac_seurat.RDS")
+
+# DimPlot looks for UMAP first, so the peakvi_UMAP generated will be visualized
+DimPlot(object = atac.seurat, label = TRUE) + NoLegend()
+
+# INFERRED GENE EXPRESSION MATRIX FROM ATAC ONLY
+
+atac.seurat <- readRDS("data/rna_atac_seurat.RDS")
+# visualization
+DefaultAssay(atac.seurat) <- "RNA"
+options(repr.plot.width=12, repr.plot.height=10)
+
+FeaturePlot(
+  object = atac.seurat,
+  features = c('Pax6', 'Atoh1', 'Msx1', 'Mki67', 'Eomes', 'Ptf1a'),
+  pt.size = 0.1,
+  max.cutoff = 'q95',
+  ncol = 3
+)
+
+# COMPARING RNA VS ATAC LABELS
+
+options(repr.plot.width=12, repr.plot.height=5)
+rna.seurat <- readRDS("data/annotated_broad_seurat.RDS")
+
+plot1 <- DimPlot(
+  object = rna.seurat,
+  group.by = 'celltype_short_scvi_0.4_manual',
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scRNA-seq')
+
+plot2 <- DimPlot(
+  object = atac.seurat,
+  group.by = 'predicted.labels',
+  label = TRUE,
+  repel = TRUE) + ggtitle('scATAC-seq')
+
+plot1 + plot2
+
+```
+
+# Finding Differentially Accessible Peaks (DARs) between clusters
+
+Note from Signac author @timoast: "The `peak_region_fragments` comes from the 10x Genomics cell metadata produced by running CellRanger, and `nCount_peaks` is computed by Seurat (the total number of fragment counts for the cell). They are highly correlated:
+```
+cor(pbmc$peak_region_fragments, pbmc$nCount_peaks)
+[1] 0.9999125
+```
+You can use either as a latent variable when finding DA peaks"
+
+`LR` parameter for `test.use` refers to a logistic regression framework to calc DEGs. Constructs a logistic regression model predicting group membership based on each feature individually and compares this to a null model with a likelihood ratio test.
+
+Instead of `LR`, using presto `wilcox` is faster. Please see [this github issue thread](https://github.com/satijalab/seurat/issues/5227) for context.
+
+`wilcox` : Identifies DEGs between two groups of cells using a Wilcoxon Rank Sum test (default); will use a fast implementation by Presto if installed (which we do!).
+
+https://docs.scvi-tools.org/en/stable/tutorials/notebooks/atac/peakvi_in_R.html#finding-differentially-accessible-peaks-between-clusters
+
+```{r dar}
+adata$obs$insert(adata$obs$shape[1], "predicted_ct", atac.combined[["predicted.labels"]][,1])
+
+saveRDS(atac.combined, "data/atac_predicted.RDS")
+
+```
+
+

@@ -1,0 +1,479 @@
+---
+title: "scRNA_2_integration"
+author: "akrenip"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Purpose
+To assess Harmony vs. scVI as integration methods and to explore the clustering results. Divided into 2 parts: 
+1. Preliminary clustering with unintegrated data, with an exploratory look at how data separates by dataset, timepoint, and cell-cycle phase. 
+  - Harmony & scVI Integration workflow, and visualizing the differences between the two integration approaches. 
+2. Quality control. This is a necessary sanity check to make sure the unsupervised ML methods used in dimension reduction actually captured "biologically meaningful" cell types.  
+
+The purpose of this comparative approach mirrors the [Harvard Bioinformatics Core tutorial](https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/06_integration.md), specifically citing a benchmarking paper by [Leucken et al. (2022)](https://www.nature.com/articles/s41592-021-01336-8). For further reading, please see their breakdown of different integration algorithms, particularly [fig. 3](https://www.nature.com/articles/s41592-021-01336-8/figures/3).
+
+The commented-out save/load statements can be used when needed. Otherwise, only the first and last i/o is necessary from moving between .RMDs. 
+
+# Imports
+
+```{r setup}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(stringr)
+library(Azimuth)
+library(reticulate)
+
+options(future.globals.maxSize = 3e+09)
+```
+
+```{r import joined_seurat}
+joined.seurat <- readRDS("data/scored_joined_seurat.RDS")
+```
+
+# Integration
+
+All clustering will be run with the following resolutions: `resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.4)`. 
+
+Another thing: Seurat version 5 has the option of building a sketched array such that only a subset of cells are loaded in. [Their tutorial](https://satijalab.org/seurat/articles/parsebio_sketch_integration) walks through how to do integrative analyses with an n=1M dataset. However, at this point, there are [dealbreaker bugs](https://github.com/satijalab/seurat/issues/7656) associated with the sketch/extend steps (and SCTransformation, if you've chosen that route). Optimistically, this can be a future feature once the bugs are squished. Until then, please take my month-long fruitless endeavor as a cautionary tale. 
+
+## Sanity check: Unintegrated clustering
+```{r unintegrated_full_obj}
+joined.seurat <-
+  FindNeighbors(joined.seurat, dims = 1:30, reduction = "pca.CC.Difference") %>%
+  FindClusters(
+    resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.4),
+    cluster.name = c(
+      "unintegrated_res.0.2",
+      "unintegrated_res.0.4",
+      "unintegrated_res.0.6",
+      "unintegrated_res.0.8",
+      "unintegrated_res.1.0",
+      "unintegrated_res.1.4"
+    )
+  )
+# Assign identity of clusters
+Idents(object = joined.seurat) <- "unintegrated_res.0.4"
+
+joined.seurat <- RunUMAP(
+  joined.seurat,
+  dims = 1:30,
+  reduction = "pca.CC.Difference",
+  reduction.name = "umap.unintegrated"
+)
+
+# saveRDS(joined.seurat, "data/unintegrated_full_seurat.RDS")
+# joined.seurat <- readRDS("data/unintegrated_full_seurat.RDS")
+```
+
+```{r visualize_unintegrated}
+# visualize
+DimPlot(object = joined.seurat,
+        reduction = "umap.unintegrated",
+        group.by = "orig.ident",
+        order = timepoint_order[rev(1:length(timepoint_order))],
+        pt.size = 2,
+        raster = TRUE,
+        raster.dpi = c(2048, 2048)
+        ) + ggtitle("timepoint")
+DimPlot(object = joined.seurat,
+        reduction = "umap.unintegrated",
+        group.by = "old.ident",
+        pt.size = 2,
+        raster = TRUE,
+        raster.dpi = c(2048, 2048)) + ggtitle("database")
+DimPlot(object = joined.seurat,
+        reduction = "umap.unintegrated",
+        group.by = "Phase",
+        pt.size = 2,
+        raster = TRUE,
+        raster.dpi = c(2048, 2048)) + ggtitle("cell-cycle phase")
+```
+
+
+## Harmony integration with full Seurat object
+```{r harmony_integration}
+joined.seurat[["RNA"]] <- split(joined.seurat[["RNA"]], f = joined.seurat$database.id)
+
+joined.seurat <- IntegrateLayers(
+  object = joined.seurat,
+  method = HarmonyIntegration,
+  orig.reduction = "pca.CC.Difference",
+  new.reduction = "integrated.harmony",
+  verbose = FALSE
+)
+
+# Harmony clusters
+joined.seurat <-
+  FindNeighbors(joined.seurat, reduction = "integrated.harmony", dims = 1:30) %>%
+  FindClusters(resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.4),
+               cluster.name = c("harmony_full_res.0.2",
+                                "harmony_full_res.0.4",
+                                "harmony_full_res.0.6",
+                                "harmony_full_res.0.8",
+                                "harmony_full_res.1.0",
+                                "harmony_full_res.1.4"))
+
+# Assign identity of clusters
+Idents(object = joined.seurat) <- "harmony_full_res.0.4"
+
+joined.seurat <- RunUMAP(
+  joined.seurat,
+  reduction = "integrated.harmony",
+  reduction.name = "umap.harmony",
+  dims = 1:30,
+  return.model = T,
+  verbose = F
+)
+```
+
+The following code block is for users that, like me, need to run scVI integration in-console separately. 
+
+```{r save_intermediate_obj}
+saveRDS(joined.seurat, "data/integrated_full_harmony_seurat.RDS")
+# joined.seurat <- readRDS("data/integrated_full_harmony_seurat.RDS")
+```
+## scVI integration with full Seurat object
+
+Seurat v5 does offer scVI support, but installation is a hassle. I ended up creating a scvi-tools conda environment and running the integration step **in-console** on Sockeye with an interactive node. Please note that Seurat's version of scVI is through reticulate, which apparently only contains "basic" (but sufficient!) functionality. Please see the [scvi-tools website](https://docs.scvi-tools.org/en/stable/installation.html#r) for further reading. 
+
+
+### Installation 
+
+If you can successfully install scvi and macs2 in your environment/apptainer, then please skip this section and move onto "Running scVI Integration on an interactive node". Otherwise, this is verbatim how I built the apptainer and scvi conda environment: 
+
+```
+module load gcc apptainer
+cd /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/
+# Create apptainer called miniconda.sif by pulling the docker file: docker://continuumio/miniconda3:main
+apptainer pull --name miniconda.sif docker://continuumio/miniconda3:main
+apptainer shell --writable --fakeroot miniconda.sif
+apptainer shell --home /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing --env XDG_CACHE_HOME=/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/ /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/miniconda.sif
+
+# inside the apptainer
+
+# scvi-env, python=3.9
+conda create -p /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/scvi-env python=3.9
+source activate /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/scvi-env
+conda install scvi-tools -c conda-forge -y
+conda install -c conda-forge r-base r-essentials r-reticulate -y
+
+```
+
+### Running scVI Integration on an interactive node
+
+If you can perform the following without Sockeye's interactive node, feel free to skip this section. 
+
+In Sockeye, navigate to your scratch space before activating the .sif file and R. Please REPLACE the filepath in `readRDS()` as needed.
+
+
+```
+# replace the cd filepath with your working directory
+cd /scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/
+module load gcc apptainer
+salloc --time=3:0:0 --mem=128G --nodes=1 --ntasks=2 --cpus-per-task=8 --account=st-dg0ldo-1
+apptainer shell --home /scratch/st-dg0ldo-1/akrenip/my_rstudio --env XDG_CACHE_HOME=/scratch/st-dg0ldo-1/akrenip/my_rstudio /arc/project/st-dg0ldo-1/rstudio/v5SeuratSignac/
+R
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(stringr)
+library(Azimuth) 
+library(reticulate)
+path_to_scvi_env <- "/scratch/st-dg0ldo-1/akrenip/my_rstudio/v5SeuratSignac_preprocessing/miniconda-env/scvi-env/"
+# REPLACE the filepath with the location of your SeuratObject
+joined.seurat <- readRDS("data/integrated_full_harmony_seurat.RDS")
+joined.seurat <- IntegrateLayers(
+  object = joined.seurat, method = scVIIntegration,
+  orig.reduction = "pca.CC.Difference",
+  new.reduction = "integrated.scvi",
+  conda_env = path_to_scvi_env,
+  verbose = TRUE
+)
+joined.seurat <- FindNeighbors(joined.seurat, reduction = "integrated.scvi", dims = 1:30)
+joined.seurat <- FindClusters(joined.seurat, resolution = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.4), cluster.name = c("scvi_full_res.0.2", "scvi_full_res.0.4", "scvi_full_res.0.6", "scvi_full_res.0.8", "scvi_full_res.1.0", "scvi_full_res.1.4"))
+Idents(object = joined.seurat) <- "scvi_full_res.0.4"
+joined.seurat <- RunUMAP(joined.seurat, reduction = "integrated.scvi", reduction.name = "umap.scvi", dims = 1:30, return.model = T, verbose = T)
+saveRDS(joined.seurat, "data/full_scvi_harmony_seurat.RDS")
+quit()
+exit
+scancel # insert jobID here
+```
+```{r load_intermediate_obj}
+joined.seurat <- readRDS("data/full_scvi_harmony_seurat.RDS")
+```
+
+## Visualizing clusters of full object
+
+The following visualization block is to help visualize the differences between Harmony and scVI integration based on: 
+  - `orig.ident`, which denotes timepoint (e10 to p63).
+  - `database.id`, meaning if the cell comes from the Carter, Vladoiu, xor Sepp dataset. 
+  - `Phase`, aka cell phase, as a way to visualize cycling vs. non-cycling cells. 
+  - Lastly, by resolution. For brevity, only resolutions 0.2, 0.4, and 0.8 were chosen. 
+```{r visualizing_all_integration}
+timepoint_order = c(
+  "e10",
+  "e11",
+  "e12",
+  "e13" ,
+  "e14" ,
+  "e15",
+  "e16" ,
+  "e17" ,
+  "e18" ,
+  "p0",
+  "p4",
+  "p5" ,
+  "p7" ,
+  "p10" ,
+  "p14",
+  "p63"
+)
+
+# timepoint comparison
+Idents(object = joined.seurat) <- "harmony_full_res.0.4"
+timepoint_harmony <- DimPlot(
+  joined.seurat,
+  reduction = "umap.harmony",
+  group.by = c("orig.ident"),
+  order = timepoint_order[rev(1:length(timepoint_order))],
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+  label.size = 2
+) + ggtitle("Harmony clusters by timepoint at 0.4 resolution")
+
+Idents(object = joined.seurat) <- "scvi_full_res.0.4"
+timepoint_scvi <- DimPlot(
+  joined.seurat,
+  reduction = "umap.scvi",
+  group.by = c("orig.ident"),
+  order = timepoint_order[rev(1:length(timepoint_order))],
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+  label.size = 2
+) + ggtitle("scVI clusters by timepoint at 0.4 resolution")
+
+timepoint_harmony + timepoint_scvi + plot_layout(nrow = 1)
+
+# database comparison
+Idents(object = joined.seurat) <- "harmony_full_res.0.4"
+database_harmony <- DimPlot(
+  joined.seurat,
+  reduction = "umap.harmony",
+  group.by = c("database.id"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+  label.size = 2
+) + ggtitle("Harmony clusters by database at 0.4 resolution")
+
+Idents(object = joined.seurat) <- "scvi_full_res.0.4"
+database_scvi <- DimPlot(
+  joined.seurat,
+  reduction = "umap.scvi",
+  group.by = c("database.id"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048), 
+  label.size = 2
+) + ggtitle("scVI clusters by database at 0.4 resolution")
+database_harmony + database_scvi + plot_layout(nrow = 1)
+
+# cell phase comparison
+Idents(object = joined.seurat) <- "harmony_full_res.0.4"
+cellcycle_phase_harmony <- DimPlot(
+  joined.seurat,
+  reduction = "umap.harmony",
+  group.by = c("Phase"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+  label.size = 2
+) + ggtitle("Harmony clusters by cell-cycle phase at 0.4 resolution")
+
+Idents(object = joined.seurat) <- "scvi_full_res.0.4"
+cellcycle_phase_scvi <- DimPlot(
+  joined.seurat,
+  reduction = "umap.scvi",
+  group.by = c("Phase"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048), 
+  label.size = 2
+) + ggtitle("scVI clusters by cell-cycle phase at 0.4 resolution")
+cellcycle_phase_harmony + cellcycle_phase_scvi + plot_layout(nrow = 1)
+
+# all cluster comparison for resolutions
+
+# resolution = 0.4
+Idents(object = joined.seurat) <- "harmony_full_res.0.4"
+total_harmony_04 <- DimPlot(
+  joined.seurat,
+  reduction = "umap.harmony",
+  group.by = "harmony_full_res.0.4",
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+) + ggtitle("Harmony clusters at 0.4 resolution")
+
+Idents(object = joined.seurat) <- "scvi_full_res.0.4"
+total_scvi_04 <- DimPlot(
+  joined.seurat,
+  reduction = "umap.scvi",
+  group.by = "scvi_full_res.0.4",
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+) + ggtitle("scVI clusters at 0.4 resolution")
+
+total_harmony_04 + total_scvi_04 + plot_layout(nrow = 1)
+
+# resolution = 0.2
+Idents(object = joined.seurat) <- "harmony_full_res.0.2"
+total_harmony_02 <- DimPlot(
+  joined.seurat,
+  reduction = "umap.harmony",
+  group.by = c("harmony_full_res.0.2"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+) + ggtitle("Harmony clusters at 0.2 resolution")
+
+Idents(object = joined.seurat) <- "scvi_full_res.0.2"
+total_scvi_02 <- DimPlot(
+  joined.seurat,
+  reduction = "umap.scvi",
+  group.by = c("scvi_full_res.0.2"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+) + ggtitle("scVI clusters at 0.2 resolution")
+
+total_harmony_02 + total_scvi_02 + plot_layout(nrow = 1)
+
+# resolution = 0.8
+Idents(object = joined.seurat) <- "harmony_full_res.0.8"
+total_harmony_08 <- DimPlot(
+  joined.seurat,
+  reduction = "umap.harmony",
+  group.by = c("harmony_full_res.0.8"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+) + ggtitle("Harmony clusters at 0.8 resolution")
+
+Idents(object = joined.seurat) <- "scvi_full_res.0.8"
+total_scvi_08 <- DimPlot(
+  joined.seurat,
+  reduction = "umap.scvi",
+  group.by = c("scvi_full_res.0.8"),
+  combine = TRUE,
+  pt.size = 2,
+  raster = TRUE,
+  raster.dpi = c(2048, 2048),
+) + ggtitle("scVI clusters at 0.8 resolution")
+
+total_harmony_08 + total_scvi_08 + plot_layout(nrow = 1)
+```
+
+# Quality control
+
+## Looking at distribution of clusters by dataset
+
+Histogram of clusters based on the cell's dataset of origin. 
+```{r cluster_by_sample_barplot}
+Idents(object = joined.seurat) <- "scvi_full_res.0.4"
+n_cells <- FetchData(joined.seurat, 
+                     vars = c("scvi_full_res.0.4", "database.id")) %>%
+        dplyr::count(scvi_full_res.0.4, database.id)
+
+# plot bars
+ggplot(n_cells, aes(x = database.id, y = n, fill = scvi_full_res.0.4)) +
+  geom_bar(position = position_dodge(), stat = "identity")
+# + geom_text(aes(label=n), vjust = -.2, position=position_dodge(1))
+```
+
+```{r umap_by_dataset}
+DimPlot(joined.seurat, 
+        label = TRUE,
+        raster = TRUE,
+        raster.dpi = c(2048, 2048),
+        split.by = "database.id")  + NoLegend()
+
+# Barplot of proportion of cells in each cluster by sample
+ggplot(joined.seurat@meta.data) +
+    geom_bar(aes(x=scvi_full_res.0.4, fill=database.id), position=position_fill()) 
+
+# Separation of cells by cell-cycle phase
+# Explore whether clusters segregate by cell cycle phase
+# Having differences between G1 vs G2M+S is okay vs. differences between G2M vs S is worrisome (since this "difference" was purposely regressed out)
+DimPlot(joined.seurat,
+        label = TRUE, 
+        raster = TRUE,
+        raster.dpi = c(1024, 1024),
+        split.by = "Phase")  + NoLegend()
+```
+
+### Extra visualization of dataset origin 
+```{r dataset_and_resolution}
+# Barplot of proportion of cells in each cluster by sample
+ggplot(joined.seurat@meta.data) +
+    geom_bar(aes(x=scvi_full_res.0.2, fill=database.id))  + ggtitle("Cell counts by cluster at 0.2 resolution")
+
+ggplot(joined.seurat@meta.data) +
+    geom_bar(aes(x=scvi_full_res.0.4, fill=database.id)) + ggtitle("Cell counts by cluster at 0.4 resolution")
+
+ggplot(joined.seurat@meta.data) +
+    geom_bar(aes(x=scvi_full_res.0.8, fill=database.id)) + ggtitle("Cell counts by cluster at 0.8 resolution")
+```
+
+
+Looking for clusters that represent "uninteresting" variation. For the purposes of this analysis, difference in cell cycle (i.e. such that the differences between G2M and S have been regressed out while keeping the variation between G1 vs G2M+S) are relevant because we are "tracing" cell types from more proliferative (i.e. cycling; G2M + S) to more mature (i.e. non-cycling; G1) states. 
+
+Thus, "uninteresting sources" of variation are: 
+  - nCount_RNA: Clusters that represent cells that are similar by their amount of unique molecular identifiers. 
+  - nFeature_RNA: Clusters representing cells with a certain number of genes.
+  - mitoRatio, percent_ribo, percent_hb, percent_platlet: Clusters with cells representing a similar level of "contamination". 
+    - "Contamination", in this case, are defined as genes associated with mitochondria, ribosomes, blood cells, and platelets.
+    
+At this point, the amount of ribosomal genes in the left-most metacluster seem abnormally higher. In the next annotation vignette, these clusters will be further investigated. 
+
+```{r uninteresting_sources_of_variation}
+# Determine metrics to plot present in seurat_integrated@meta.data
+metrics <-  c("nCount_RNA", "nFeature_RNA", "percent_mito", "percent_ribo", "percent_hb", "percent_platlet")
+
+FeaturePlot(joined.seurat, 
+            reduction = "umap.scvi", 
+            features = metrics,
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q10', # lowest 10% of cells will be completely greyed out
+            label = TRUE,
+            raster = TRUE)
+```
+
+No changes made in the quality control section, but just for a sense of finality, this i/o block is here. 
+```{r saving_loading}
+saveRDS(joined.seurat, "data/unannotated_seurat.RDS")
+# joined.seurat <- readRDS("data/unannotated_seurat.RDS")
+```
