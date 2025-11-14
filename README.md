@@ -23,6 +23,40 @@ Replicating this project requires high-performance computing (HPC). Personally, 
 
 This project uses a combination of R and Python, in the form of RMarkdown vignettes and JupyterNotebooks, respectively. The desired packages for each step are built using Apptainer/Singularity. I have included the .def files in this repo for reference, but have replaced filepaths with dummy variables for obvious reasons. 
 
+## Organizing publicly available datasets
+
+When creating a [Seurat object](https://satijalab.github.io/seurat-object/reference/CreateSeuratObject.html), the given folder must have "barcodes.tsv", "genes.tsv", and "matrix.mtx" without any other prefix!
+
+Currently my datasets are organized as follows, with the GSE number and first authors are noted on the parent directory, and GSM number and replicate are noted in the subdirectories. The .gz files themselves are only named "barcodes.tsv", "genes.tsv", and "matrix.mtx". 
+
+```
+├── v5SeuratSignac_preprocessing.Rproj
+├── scRNA_preprocessing.Rmd
+├── GSE118068_Vladoiu 
+    ├── GSE118068_RAW.tar
+    └── GSM3317999_E10
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz
+    ├── etc. etc. etc. 
+    └── GSM3318007_P14
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz
+└── GSE224466_Carter
+    ├── GSE224466_RAW.tar
+    └── GSM7024833_PAN_CB_E13_A
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz
+    ├── etc. etc. etc.
+    └── GSM7024842_PAN_CB_P7B
+        ├── barcodes.tsv.gz
+        ├── genes.tsv.gz
+        └── matrix.mtx.gz 
+```
+Seurat's [`Read10X` function](https://satijalab.org/seurat/reference/read10x) accepts named vectors for multiple data directories.
+
 # CITATION
 
 Ip, K. (2025). Revisiting the unipolar brush cell during cerebellar embryonic development through in silico perturbation (T). University of British Columbia. Retrieved from https://open.library.ubc.ca/collections/ubctheses/24/items/1.0450337
