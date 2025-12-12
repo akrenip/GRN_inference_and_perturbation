@@ -1,5 +1,5 @@
 # GRN Inference and Perturbation
-Archive of bioinformatic approaches used in my MSc thesis. Leveraging publicly available single-cell genomics to create gene regulatory networks (GRNs) in an accessible and reproducible fashion. 
+Training materials for the bioinformatic approaches used in my MSc thesis. Leveraging publicly available single-cell genomics to create gene regulatory networks (GRNs) in an accessible and reproducible fashion. 
 
 My research interest is in developmental neuroinformatics, but this workflow is applicable to any niche cell type of interest / gene of interest combo according to your research question!
 
